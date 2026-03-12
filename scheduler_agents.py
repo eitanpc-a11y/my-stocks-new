@@ -272,8 +272,29 @@ def run_val_agent():
                     logger.info(f"val_agent: skipping {sym} — {consensus['reason']}")
                     continue
 
-                # 💰 Position Sizing לפי ביטחון ML
-                base  = cash * alloc_pct
+                # 🧬 RL Check — מניעת קנייה חוזרת אחרי כישלון
+                try:
+                    from rl_feedback import should_buy, get_adaptive_confidence_boost
+                    rl = should_buy(sym, min_trades=3, min_win_rate=35.0)
+                    if not rl["allowed"]:
+                        logger.info(f"val_agent: RL blocked {sym} — {rl['reason']}")
+                        continue
+                    rl_boost = get_adaptive_confidence_boost(sym)
+                except Exception:
+                    rl_boost = 0.0
+
+                # 📊 Sentiment Check — כתוב לאוטובוס לפני קנייה
+                try:
+                    from sentiment_engine import analyze_and_publish
+                    sent = analyze_and_publish(sym)
+                    if sent["direction"] == "SELL" and sent["confidence"] > 70:
+                        logger.info(f"val_agent: sentiment SELL {sym} — skipping")
+                        continue
+                except Exception:
+                    pass
+
+                # 💰 Position Sizing לפי ביטחון ML + RL Boost
+                base  = cash * alloc_pct * (1 + rl_boost / 100)
                 alloc = min(_ml_position_size(sym, base), cash * 0.20)
                 qty   = alloc / price
                 portfolio.append({
@@ -385,8 +406,29 @@ def run_day_agent():
                     logger.info(f"day_agent: skipping {sym} — no ML signal")
                     continue
 
-                # 💰 Position Sizing לפי ML Confidence
-                base  = cash * alloc_pct
+                # 🧬 RL Check
+                try:
+                    from rl_feedback import should_buy, get_adaptive_confidence_boost
+                    rl = should_buy(sym, min_trades=3, min_win_rate=30.0)
+                    if not rl["allowed"]:
+                        logger.info(f"day_agent: RL blocked {sym} — {rl['reason']}")
+                        continue
+                    rl_boost = get_adaptive_confidence_boost(sym)
+                except Exception:
+                    rl_boost = 0.0
+
+                # 📊 Sentiment — קנייה יומית לא נגד חדשות דוביות חזקות
+                try:
+                    from sentiment_engine import analyze_and_publish
+                    sent = analyze_and_publish(sym)
+                    if sent["direction"] == "SELL" and sent["confidence"] > 75:
+                        logger.info(f"day_agent: sentiment SELL {sym} — skipping")
+                        continue
+                except Exception:
+                    pass
+
+                # 💰 Position Sizing לפי ML Confidence + RL Boost
+                base  = cash * alloc_pct * (1 + rl_boost / 100)
                 alloc = min(_ml_position_size(sym, base, hours_back=24), cash * 0.30)
                 qty   = alloc / price
                 portfolio.append({

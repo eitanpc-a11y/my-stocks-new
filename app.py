@@ -409,7 +409,11 @@ with tabs[19]:
     else:
         st.warning("⏳ מחכה לנתוני מניות... בדוק את חיבור האינטרנט.")
 
-with tabs[20]: news_ai.render_live_news(MY_STOCKS_BASE)
+with tabs[20]:
+    from sentiment_engine import render_sentiment_dashboard
+    snews1, snews2 = st.tabs(["📰 חדשות חיות", "📊 סנטימנט NLP"])
+    with snews1: news_ai.render_live_news(MY_STOCKS_BASE)
+    with snews2: render_sentiment_dashboard(list(set(MY_STOCKS_BASE + SCAN_LIST))[:25])
 with tabs[21]: analytics_ai.render_analytics_dashboard()
 with tabs[22]: telegram_ai.render_telegram_integration()
 with tabs[23]: failsafes_ai.render_failsafes()
@@ -524,6 +528,12 @@ with tabs[27]:
                 scheduler.run_ml_training()
             st.success("✅ סיים!")
             
+    st.divider()
+
+    # 🧬 Reinforcement Learning Dashboard
+    from rl_feedback import render_rl_dashboard
+    render_rl_dashboard()
+
     st.divider()
     
     col_debug1, col_debug2 = st.columns(2)

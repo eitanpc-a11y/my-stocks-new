@@ -8,6 +8,7 @@ import yfinance as yf
 from datetime import datetime
 from storage import load, save
 from shared_signals import get_top_buys
+from rl_feedback import record_trade_outcome, should_buy, get_adaptive_confidence_boost
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -144,7 +145,8 @@ def _run_auto_exit(portfolio: list, cash: float, trades: list,
         pnl_pct = ((lp / bp) - 1) * 100
 
         if pnl_pct >= tp_pct:
-            cash += lp * float(p.get("Qty", 0))
+            qty = float(p.get("Qty", 0))
+            cash += lp * qty
             trades.insert(0, {
                 "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "📌": p["Symbol"], "↔️": f"🎯 Take-Profit {label_suffix}",
@@ -152,10 +154,16 @@ def _run_auto_exit(portfolio: list, cash: float, trades: list,
                 "🏷️": p.get("Type", ""),
             })
             report.append(f"✅ {p['Symbol']} +{pnl_pct:.1f}% (TP)")
+            # 🧬 RL — רשום ניצחון
+            record_trade_outcome(
+                symbol=p["Symbol"], pnl_pct=pnl_pct, outcome="TP",
+                agent=label_suffix.strip(), entry_price=bp, exit_price=lp,
+            )
             sold += 1
 
         elif pnl_pct <= -sl_pct:
-            cash += lp * float(p.get("Qty", 0))
+            qty = float(p.get("Qty", 0))
+            cash += lp * qty
             trades.insert(0, {
                 "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "📌": p["Symbol"], "↔️": f"🛑 Stop-Loss {label_suffix}",
@@ -163,6 +171,11 @@ def _run_auto_exit(portfolio: list, cash: float, trades: list,
                 "🏷️": p.get("Type", ""),
             })
             report.append(f"🛑 {p['Symbol']} {pnl_pct:.1f}% (SL)")
+            # 🧬 RL — רשום הפסד
+            record_trade_outcome(
+                symbol=p["Symbol"], pnl_pct=pnl_pct, outcome="SL",
+                agent=label_suffix.strip(), entry_price=bp, exit_price=lp,
+            )
             sold += 1
 
         else:
@@ -279,16 +292,26 @@ def render_value_agent(df_all: pd.DataFrame):
                 st.warning("אין מזומן מספיק.")
             else:
                 existing = {p["Symbol"] for p in portfolio}
-                # Position sizing: קטן יותר בשוק ניטרלי
                 alloc_pct = 0.12 if regime["regime"] == "neutral" else 0.15
-                bought = 0
+                bought  = 0
+                skipped = []
                 for _, row in cands.iterrows():
                     sym = row["Symbol"]
                     if sym in existing or len(portfolio) >= 10: continue
                     lp  = _live(sym, float(row.get("Price", 0)))
                     if lp <= 0: continue
-                    alloc = cash * alloc_pct
-                    qty   = alloc / lp
+
+                    # 🧬 RL Check — מניעת קנייה חוזרת אחרי 2 SL ברצף
+                    rl = should_buy(sym, min_trades=3, min_win_rate=35.0)
+                    if not rl["allowed"]:
+                        skipped.append(f"{sym} ({rl['reason']})")
+                        continue
+
+                    # Adaptive confidence boost מניסיון עבר
+                    boost    = get_adaptive_confidence_boost(sym)
+                    alloc    = cash * alloc_pct * (1 + boost / 100)
+                    alloc    = min(alloc, cash * 0.20)
+                    qty      = alloc / lp
                     portfolio.append({
                         "Symbol": sym, "BuyPrice": round(lp, 4),
                         "Qty": round(qty, 4), "BuyDate": datetime.now().isoformat(),
@@ -299,14 +322,18 @@ def render_value_agent(df_all: pd.DataFrame):
                     trades.insert(0, {
                         "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "📌": sym, "↔️": "קנייה",
-                        "💰": f"{lp:.3f}", "📊": f"ציון {int(row.get('Score',0))}/6 | {regime['emoji']}",
+                        "💰": f"{lp:.3f}",
+                        "📊": f"ציון {int(row.get('Score',0))}/6 | {regime['emoji']} | RL+{boost:+.0f}",
                         "🏷️": _asset_label(sym),
                     })
                     bought += 1
                 save("val_portfolio", portfolio)
                 save("val_cash_ils", round(cash, 2))
                 save("val_trades_log", trades[:200])
-                st.success(f"✅ נקנו {bought} נכסים! הגנה: TP +{val_tp}% / SL -{val_sl}%")
+                msg = f"✅ נקנו {bought} נכסים! TP +{val_tp}% / SL -{val_sl}%"
+                if skipped:
+                    msg += f"\n⚠️ RL חסם: {', '.join(skipped[:3])}"
+                st.success(msg)
                 st.rerun()
 
         if buy_disabled:
@@ -496,13 +523,22 @@ def render_day_trade_agent(df_all: pd.DataFrame):
             else:
                 existing = {p["Symbol"] for p in portfolio}
                 alloc_pct = 0.15 if regime["regime"] == "neutral" else 0.25
-                bought = 0
+                bought  = 0
+                skipped = []
                 for _, row in day_cands.iterrows():
                     sym = row["Symbol"]
                     if sym in existing or len(portfolio) >= 5: continue
                     lp  = _live(sym, float(row.get("Price", 0)))
                     if lp <= 0: continue
-                    alloc = min(cash * alloc_pct, cash)
+
+                    # 🧬 RL Check
+                    rl = should_buy(sym, min_trades=3, min_win_rate=30.0)
+                    if not rl["allowed"]:
+                        skipped.append(sym)
+                        continue
+
+                    boost = get_adaptive_confidence_boost(sym)
+                    alloc = min(cash * alloc_pct * (1 + boost / 100), cash)
                     qty   = alloc / lp
                     portfolio.append({
                         "Symbol": sym, "BuyPrice": round(lp, 4),
@@ -514,14 +550,18 @@ def render_day_trade_agent(df_all: pd.DataFrame):
                     trades.insert(0, {
                         "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "📌": sym, "↔️": "קנייה-יומי",
-                        "💰": f"{lp:.3f}", "📊": f"RSI {row.get('RSI',0):.0f} | {regime['emoji']}",
+                        "💰": f"{lp:.3f}",
+                        "📊": f"RSI {row.get('RSI',0):.0f} | {regime['emoji']} | RL{boost:+.0f}",
                         "🏷️": _asset_label(sym),
                     })
                     bought += 1
                 save("day_portfolio", portfolio)
                 save("day_cash_ils", round(cash, 2))
                 save("day_trades_log", trades[:300])
-                st.success(f"✅ נקנו {bought} פוזיציות! TP +{day_tp}% / SL -{day_sl}%")
+                msg = f"✅ נקנו {bought} פוזיציות! TP +{day_tp}% / SL -{day_sl}%"
+                if skipped:
+                    msg += f" | RL חסם: {', '.join(skipped)}"
+                st.success(msg)
                 st.rerun()
 
     with b2:
