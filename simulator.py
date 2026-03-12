@@ -9,6 +9,7 @@ from datetime import datetime
 from storage import load, save
 from shared_signals import get_top_buys
 from rl_feedback import record_trade_outcome, should_buy, get_adaptive_confidence_boost
+from sector_diversifier import can_buy_sector, render_sector_breakdown
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -301,6 +302,12 @@ def render_value_agent(df_all: pd.DataFrame):
                     lp  = _live(sym, float(row.get("Price", 0)))
                     if lp <= 0: continue
 
+                    # 🗂️ Sector Diversification — לא יותר מ-2 מאותו סקטור
+                    sec_chk = can_buy_sector(sym, portfolio, max_per_sector=2)
+                    if not sec_chk["allowed"]:
+                        skipped.append(f"{sym} ({sec_chk['reason']})")
+                        continue
+
                     # 🧬 RL Check — מניעת קנייה חוזרת אחרי 2 SL ברצף
                     rl = should_buy(sym, min_trades=3, min_win_rate=35.0)
                     if not rl["allowed"]:
@@ -382,6 +389,11 @@ def render_value_agent(df_all: pd.DataFrame):
             save("val_trades_log", [])
             st.success("✅ אופס!")
             st.rerun()
+
+    # ── Sector Breakdown ─────────────────────────────────────────────────
+    if portfolio:
+        with st.expander("🗂️ גיוון סקטוריאלי בתיק", expanded=False):
+            render_sector_breakdown(portfolio)
 
     # ── Portfolio table עם TP/SL progress ───────────────────────────────
     if portfolio:
@@ -531,6 +543,12 @@ def render_day_trade_agent(df_all: pd.DataFrame):
                     lp  = _live(sym, float(row.get("Price", 0)))
                     if lp <= 0: continue
 
+                    # 🗂️ Sector Diversification — יומי מחמיר פחות (מקסימום 3)
+                    sec_chk = can_buy_sector(sym, portfolio, max_per_sector=3)
+                    if not sec_chk["allowed"]:
+                        skipped.append(f"{sym} ({sec_chk['sector_he']})")
+                        continue
+
                     # 🧬 RL Check
                     rl = should_buy(sym, min_trades=3, min_win_rate=30.0)
                     if not rl["allowed"]:
@@ -617,6 +635,11 @@ def render_day_trade_agent(df_all: pd.DataFrame):
                 win_rate = round(len(wins) / total_t * 100) if total_t else 0
                 st.info(f"🏆 Win Rate: **{win_rate}%** | "
                         f"✅ TP: {len(wins)} | 🛑 SL: {len(losses)} | סה\"כ: {total_t}")
+
+    # ── Sector Breakdown ─────────────────────────────────────────────────
+    if portfolio:
+        with st.expander("🗂️ גיוון סקטוריאלי", expanded=False):
+            render_sector_breakdown(portfolio)
 
     # ── Portfolio table ───────────────────────────────────────────────────
     if portfolio:

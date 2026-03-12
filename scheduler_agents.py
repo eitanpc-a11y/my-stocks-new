@@ -272,6 +272,16 @@ def run_val_agent():
                     logger.info(f"val_agent: skipping {sym} — {consensus['reason']}")
                     continue
 
+                # 🗂️ Sector Diversification — לא יותר מ-2 מניות לסקטור
+                try:
+                    from sector_diversifier import can_buy_sector
+                    sec_check = can_buy_sector(sym, portfolio, max_per_sector=2)
+                    if not sec_check["allowed"]:
+                        logger.info(f"val_agent: sector blocked {sym} — {sec_check['reason']}")
+                        continue
+                except Exception:
+                    pass
+
                 # 🧬 RL Check — מניעת קנייה חוזרת אחרי כישלון
                 try:
                     from rl_feedback import should_buy, get_adaptive_confidence_boost
@@ -405,6 +415,16 @@ def run_day_agent():
                 if not consensus["approved"]:
                     logger.info(f"day_agent: skipping {sym} — no ML signal")
                     continue
+
+                # 🗂️ Sector Diversification — יומי מחמיר פחות (מקסימום 3)
+                try:
+                    from sector_diversifier import can_buy_sector
+                    sec_check = can_buy_sector(sym, portfolio, max_per_sector=3)
+                    if not sec_check["allowed"]:
+                        logger.info(f"day_agent: sector blocked {sym} — {sec_check['reason']}")
+                        continue
+                except Exception:
+                    pass
 
                 # 🧬 RL Check
                 try:
