@@ -130,7 +130,8 @@ def _regime_banner():
 def _run_auto_exit(portfolio: list, cash: float, trades: list,
                    tp_pct: float, sl_pct: float, label_suffix: str = "") -> tuple:
     """
-    עובר על כל הפוזיציות ומוכר אוטומטית אם הגיעו ל-TP או SL.
+    עובר על כל הפוזיציות ומוכר אוטומטית אם הגיעו ל-TP או Trailing-SL.
+    Trailing SL: SL מחושב מהשיא ההיסטורי (TrailingHigh) — לא מהקנייה.
     מחזיר (portfolio_new, cash_new, trades_new, sold_count, report)
     """
     new_port = []
@@ -143,7 +144,15 @@ def _run_auto_exit(portfolio: list, cash: float, trades: list,
         if bp <= 0:
             new_port.append(p); continue
 
-        pnl_pct = ((lp / bp) - 1) * 100
+        # ── Trailing High — מעדכן שיא רץ ──────────────────────────────
+        trail_high = float(p.get("TrailingHigh", bp))
+        if lp > trail_high:
+            trail_high = lp
+            p = {**p, "TrailingHigh": round(trail_high, 4)}
+
+        pnl_pct        = ((lp / bp) - 1) * 100
+        trail_sl_price = trail_high * (1 - sl_pct / 100)   # SL מהשיא
+        trail_drawdown = ((lp / trail_high) - 1) * 100     # ירידה מהשיא
 
         if pnl_pct >= tp_pct:
             qty = float(p.get("Qty", 0))
@@ -155,24 +164,25 @@ def _run_auto_exit(portfolio: list, cash: float, trades: list,
                 "🏷️": p.get("Type", ""),
             })
             report.append(f"✅ {p['Symbol']} +{pnl_pct:.1f}% (TP)")
-            # 🧬 RL — רשום ניצחון
             record_trade_outcome(
                 symbol=p["Symbol"], pnl_pct=pnl_pct, outcome="TP",
                 agent=label_suffix.strip(), entry_price=bp, exit_price=lp,
             )
             sold += 1
 
-        elif pnl_pct <= -sl_pct:
+        elif lp <= trail_sl_price:
+            # Trailing SL — ירד יותר מ-sl_pct% מהשיא
             qty = float(p.get("Qty", 0))
             cash += lp * qty
             trades.insert(0, {
                 "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "📌": p["Symbol"], "↔️": f"🛑 Stop-Loss {label_suffix}",
-                "💰": f"{lp:.3f}", "📊": f"{pnl_pct:.1f}%",
+                "📌": p["Symbol"],
+                "↔️": f"🛑 Trailing-SL {label_suffix}",
+                "💰": f"{lp:.3f}",
+                "📊": f"{pnl_pct:.1f}% | ↘️{trail_drawdown:.1f}% מהשיא {trail_high:.3f}",
                 "🏷️": p.get("Type", ""),
             })
-            report.append(f"🛑 {p['Symbol']} {pnl_pct:.1f}% (SL)")
-            # 🧬 RL — רשום הפסד
+            report.append(f"🛑 {p['Symbol']} {pnl_pct:.1f}% (Trailing-SL מ-{trail_high:.2f})")
             record_trade_outcome(
                 symbol=p["Symbol"], pnl_pct=pnl_pct, outcome="SL",
                 agent=label_suffix.strip(), entry_price=bp, exit_price=lp,
@@ -183,6 +193,63 @@ def _run_auto_exit(portfolio: list, cash: float, trades: list,
             new_port.append(p)
 
     return new_port, cash, trades, sold, report
+
+
+# ════════════════════════════════════════════════════════════════════════
+# 🔁 PORTFOLIO REBALANCER — מוכר חלק כשפוזיציה חורגת ממשקל מקסימלי
+# ════════════════════════════════════════════════════════════════════════
+def _run_rebalance(portfolio: list, cash: float, trades: list,
+                   max_weight_pct: float, label_suffix: str = "") -> tuple:
+    """
+    בודק כל פוזיציה: אם ערכה > max_weight_pct% מסך התיק — מוכר עודף.
+    מחזיר (portfolio_new, cash_new, trades_new, rebalanced_count, report)
+    """
+    if not portfolio:
+        return portfolio, cash, trades, 0, []
+
+    positions_value = sum(_live(p["Symbol"], p.get("BuyPrice", 0)) * float(p.get("Qty", 0))
+                          for p in portfolio)
+    total_value = positions_value + cash
+    if total_value <= 0:
+        return portfolio, cash, trades, 0, []
+
+    target_value = total_value * (max_weight_pct / 100)
+    new_port     = []
+    rebalanced   = 0
+    report       = []
+
+    for p in portfolio:
+        lp  = _live(p["Symbol"], p.get("BuyPrice", 0))
+        qty = float(p.get("Qty", 0))
+        pos_value = lp * qty
+        weight    = pos_value / total_value * 100
+
+        if weight > max_weight_pct and lp > 0 and qty > 0:
+            # מוכר רק את העודף — נשאר עם target_value בפוזיציה
+            sell_value = pos_value - target_value
+            sell_qty   = sell_value / lp
+            new_qty    = qty - sell_qty
+            pnl_pct    = ((lp / float(p.get("BuyPrice", lp))) - 1) * 100
+
+            cash += sell_value
+            trades.insert(0, {
+                "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "📌": p["Symbol"],
+                "↔️": f"🔁 Rebalance {label_suffix}",
+                "💰": f"{lp:.3f}",
+                "📊": f"⚖️ {weight:.0f}%→{max_weight_pct:.0f}% | מכירת {sell_qty:.3f} יח'",
+                "🏷️": p.get("Type", ""),
+            })
+            report.append(f"🔁 {p['Symbol']} {weight:.0f}%→{max_weight_pct:.0f}%")
+            rebalanced += 1
+
+            if new_qty > 0.0001:
+                new_p = {**p, "Qty": round(new_qty, 4)}
+                new_port.append(new_p)
+        else:
+            new_port.append(p)
+
+    return new_port, cash, trades, rebalanced, report
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -213,25 +280,33 @@ def render_value_agent(df_all: pd.DataFrame):
     initial   = float(load("val_initial", 100000.0))
 
     # ── הגדרות Stop-Loss / Take-Profit ──────────────────────────────────
-    with st.expander("⚙️ הגדרות Stop-Loss / Take-Profit", expanded=False):
-        col_tp, col_sl = st.columns(2)
-        val_tp = col_tp.slider("🎯 Take-Profit %", 5, 50, 20, 1, key="val_tp_pct",
+    with st.expander("⚙️ הגדרות Stop-Loss / Take-Profit / Rebalance", expanded=False):
+        col_tp, col_sl, col_rb = st.columns(3)
+        val_tp = col_tp.slider("🎯 Take-Profit %",     5, 50, 20, 1, key="val_tp_pct",
                                help="מוכר כשהרווח מגיע לאחוז זה")
-        val_sl = col_sl.slider("🛑 Stop-Loss %",   3, 25, 10, 1, key="val_sl_pct",
-                               help="מוכר כשההפסד מגיע לאחוז זה")
+        val_sl = col_sl.slider("🛑 Trailing Stop %",   3, 25, 10, 1, key="val_sl_pct",
+                               help="מוכר כשירידה מהשיא מגיעה לאחוז זה")
+        val_rb = col_rb.slider("🔁 Rebalance מקס %",  15, 50, 30, 5, key="val_rebalance_pct",
+                               help="מוכר עודף כשפוזיציה חורגת ממשקל זה בתיק")
         save("val_tp_pct", val_tp)
         save("val_sl_pct", val_sl)
+        save("val_rebalance_pct", val_rb)
 
     # ── Auto Exit — רץ בכל טעינת עמוד ──────────────────────────────────
     if portfolio:
         portfolio, cash, trades, auto_sold, auto_report = _run_auto_exit(
             portfolio, cash, trades, val_tp, val_sl, "ערך"
         )
-        if auto_sold > 0:
+        portfolio, cash, trades, rb_count, rb_report = _run_rebalance(
+            portfolio, cash, trades, val_rb, "ערך"
+        )
+        all_actions = auto_report + rb_report
+        if auto_sold > 0 or rb_count > 0:
             save("val_portfolio", portfolio)
             save("val_cash_ils", round(cash, 2))
             save("val_trades_log", trades[:200])
-            st.toast(f"🤖 Auto-Exit: {', '.join(auto_report)}", icon="🔔")
+            if all_actions:
+                st.toast(f"🤖 {', '.join(all_actions)}", icon="🔔")
 
     pv    = _port_value(portfolio)
     total = cash + pv
@@ -321,6 +396,7 @@ def render_value_agent(df_all: pd.DataFrame):
                     qty      = alloc / lp
                     portfolio.append({
                         "Symbol": sym, "BuyPrice": round(lp, 4),
+                        "TrailingHigh": round(lp, 4),
                         "Qty": round(qty, 4), "BuyDate": datetime.now().isoformat(),
                         "Score": int(row.get("Score", 0)), "Type": _asset_label(sym),
                     })
@@ -409,14 +485,17 @@ def render_value_agent(df_all: pd.DataFrame):
             bar_len   = 10
             filled    = max(0, min(bar_len, int((profit + val_sl) / (val_tp + val_sl) * bar_len)))
             bar       = "█" * filled + "░" * (bar_len - filled)
+            trail_high = float(p.get("TrailingHigh", bp))
+            from_peak  = ((lp / trail_high) - 1) * 100 if trail_high else 0
             rows.append({
                 "📌 סימול":   p["Symbol"],
                 "🏷️ סוג":    p.get("Type", ""),
                 "💵 כניסה":  f"{bp:.3f}",
+                "🏔️ שיא":   f"{trail_high:.3f}",
                 "💰 עכשיו":  f"{lp:.3f}",
                 "📊 רווח%":  f"{'🟢+' if profit>=0 else '🔴'}{abs(profit):.1f}%",
+                "↘️ מהשיא":  f"{'🟡' if from_peak>=-3 else '🔴'}{from_peak:.1f}%",
                 "🎯 ל-TP":   f"+{to_tp:.1f}%",
-                "🛑 ל-SL":   f"-{to_sl:.1f}%",
                 "📈 מסלול":  bar,
                 "📦 כמות":   f"{p['Qty']:.4f}",
             })
@@ -454,26 +533,34 @@ def render_day_trade_agent(df_all: pd.DataFrame):
     trades    = load("day_trades_log", [])
     initial   = float(load("day_initial", 100000.0))
 
-    # ── הגדרות Stop-Loss / Take-Profit ──────────────────────────────────
-    with st.expander("⚙️ הגדרות Stop-Loss / Take-Profit", expanded=False):
-        col_tp, col_sl = st.columns(2)
-        day_tp = col_tp.slider("🎯 Take-Profit %", 1, 15, 4, 1, key="day_tp_pct",
+    # ── הגדרות Stop-Loss / Take-Profit / Rebalance ──────────────────────
+    with st.expander("⚙️ הגדרות Stop-Loss / Take-Profit / Rebalance", expanded=False):
+        col_tp, col_sl, col_rb = st.columns(3)
+        day_tp = col_tp.slider("🎯 Take-Profit %",     1, 15, 4, 1, key="day_tp_pct",
                                help="מוכר כשהרווח מגיע לאחוז זה")
-        day_sl = col_sl.slider("🛑 Stop-Loss %",   1, 10, 2, 1, key="day_sl_pct",
-                               help="מוכר כשההפסד מגיע לאחוז זה")
+        day_sl = col_sl.slider("🛑 Trailing Stop %",   1, 10, 2, 1, key="day_sl_pct",
+                               help="מוכר כשירידה מהשיא מגיעה לאחוז זה")
+        day_rb = col_rb.slider("🔁 Rebalance מקס %",  10, 50, 25, 5, key="day_rebalance_pct",
+                               help="מוכר עודף כשפוזיציה חורגת ממשקל זה")
         save("day_tp_pct", day_tp)
         save("day_sl_pct", day_sl)
+        save("day_rebalance_pct", day_rb)
 
-    # ── Auto Exit — רץ בכל טעינת עמוד ──────────────────────────────────
+    # ── Auto Exit + Rebalance — רץ בכל טעינת עמוד ──────────────────────
     if portfolio:
         portfolio, cash, trades, auto_sold, auto_report = _run_auto_exit(
             portfolio, cash, trades, day_tp, day_sl, "יומי"
         )
-        if auto_sold > 0:
+        portfolio, cash, trades, rb_count, rb_report = _run_rebalance(
+            portfolio, cash, trades, day_rb, "יומי"
+        )
+        all_actions = auto_report + rb_report
+        if auto_sold > 0 or rb_count > 0:
             save("day_portfolio", portfolio)
             save("day_cash_ils", round(cash, 2))
             save("day_trades_log", trades[:300])
-            st.toast(f"🤖 Auto-Exit יומי: {', '.join(auto_report)}", icon="⚡")
+            if all_actions:
+                st.toast(f"🤖 יומי: {', '.join(all_actions)}", icon="⚡")
 
     pv    = _port_value(portfolio)
     total = cash + pv
@@ -560,6 +647,7 @@ def render_day_trade_agent(df_all: pd.DataFrame):
                     qty   = alloc / lp
                     portfolio.append({
                         "Symbol": sym, "BuyPrice": round(lp, 4),
+                        "TrailingHigh": round(lp, 4),
                         "Qty": round(qty, 4), "BuyDate": datetime.now().isoformat(),
                         "Type": _asset_label(sym),
                     })
@@ -651,14 +739,17 @@ def render_day_trade_agent(df_all: pd.DataFrame):
             profit  = ((lp / bp) - 1) * 100 if bp else 0
             to_tp   = day_tp - profit
             to_sl   = profit + day_sl
+            trail_high = float(p.get("TrailingHigh", bp))
+            from_peak  = ((lp / trail_high) - 1) * 100 if trail_high else 0
             rows.append({
                 "📌 סימול":  p["Symbol"],
                 "🏷️ סוג":   p.get("Type", ""),
                 "💵 כניסה": f"{bp:.3f}",
+                "🏔️ שיא":  f"{trail_high:.3f}",
                 "💰 עכשיו": f"{lp:.3f}",
                 "📊 P&L%":  f"{'🟢+' if profit>=0 else '🔴'}{abs(profit):.1f}%",
+                "↘️ מהשיא": f"{'🟡' if from_peak>=-1.5 else '🔴'}{from_peak:.1f}%",
                 "🎯 ל-TP":  f"+{to_tp:.1f}%",
-                "🛑 ל-SL":  f"-{to_sl:.1f}%",
                 "📦 כמות":  f"{p['Qty']:.4f}",
             })
         st.dataframe(pd.DataFrame(rows), hide_index=True)

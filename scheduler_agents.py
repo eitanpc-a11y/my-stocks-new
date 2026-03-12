@@ -216,7 +216,7 @@ def run_val_agent():
         tp_pct = float(load("val_tp_pct", 20))
         sl_pct = float(load("val_sl_pct", 10))
 
-        # ── Sell: TP או SL ─────────────────────────────────────────────────
+        # ── Sell: TP או Trailing-SL ────────────────────────────────────────
         new_port = []
         for item in portfolio:
             sym       = item.get("Symbol") or item.get("Stock", "")
@@ -225,6 +225,12 @@ def run_val_agent():
             row       = df[df["Symbol"] == sym]
             lp        = float(row["Price"].iloc[0]) if not row.empty else buy_price
             if buy_price > 0 and qty > 0:
+                # Trailing High — עדכן שיא רץ
+                trail_high = float(item.get("TrailingHigh", buy_price))
+                if lp > trail_high:
+                    trail_high = lp
+                    item = {**item, "TrailingHigh": round(trail_high, 4)}
+                trail_sl_price = trail_high * (1 - sl_pct / 100)
                 profit = ((lp / buy_price) - 1) * 100
                 if profit >= tp_pct:
                     cash += lp * qty
@@ -235,19 +241,70 @@ def run_val_agent():
                         "🏷️": _asset_type(sym),
                     })
                     logger.info(f"val_agent: TP {sym} +{profit:.1f}%")
+                    try:
+                        from rl_feedback import record_trade_outcome
+                        record_trade_outcome(sym, profit, "TP", "val", buy_price, lp)
+                    except Exception:
+                        pass
                     continue
-                if profit <= -sl_pct:
+                if lp <= trail_sl_price:
+                    trail_dd = ((lp / trail_high) - 1) * 100
                     cash += lp * qty
                     trades_log.insert(0, {
                         "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "📌": sym, "↔️": f"🛑 Stop-Loss ({sl_pct}%)",
-                        "💰": f"{lp:.3f}", "📊": f"{profit:.1f}%",
+                        "📌": sym, "↔️": f"🛑 Trailing-SL ({sl_pct}%)",
+                        "💰": f"{lp:.3f}",
+                        "📊": f"{profit:.1f}% | ↘️{trail_dd:.1f}% מ-{trail_high:.3f}",
                         "🏷️": _asset_type(sym),
                     })
-                    logger.info(f"val_agent: SL {sym} {profit:.1f}%")
+                    logger.info(f"val_agent: Trailing-SL {sym} {profit:.1f}% (peak {trail_high:.3f})")
+                    try:
+                        from rl_feedback import record_trade_outcome
+                        record_trade_outcome(sym, profit, "SL", "val", buy_price, lp)
+                    except Exception:
+                        pass
                     continue
             new_port.append(item)
         portfolio = new_port
+
+        # ── Rebalance — מוכר עודף כשפוזיציה חורגת ממשקל ──────────────────
+        rb_pct = float(load("val_rebalance_pct", 30))
+        positions_value = sum(
+            (float(df[df["Symbol"]==p.get("Symbol","")]["Price"].iloc[0])
+             if not df[df["Symbol"]==p.get("Symbol","")].empty
+             else float(p.get("BuyPrice",0)))
+            * float(p.get("Qty",0))
+            for p in portfolio
+        )
+        total_val = positions_value + cash
+        if total_val > 0:
+            target_val = total_val * (rb_pct / 100)
+            rebalanced_port = []
+            for item in portfolio:
+                sym = item.get("Symbol","")
+                row2 = df[df["Symbol"] == sym]
+                lp2  = float(row2["Price"].iloc[0]) if not row2.empty else float(item.get("BuyPrice",0))
+                qty2 = float(item.get("Qty",0))
+                pos_val = lp2 * qty2
+                weight  = pos_val / total_val * 100
+                if weight > rb_pct and lp2 > 0 and qty2 > 0:
+                    sell_val = pos_val - target_val
+                    sell_qty = sell_val / lp2
+                    new_qty  = qty2 - sell_qty
+                    cash += sell_val
+                    trades_log.insert(0, {
+                        "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "📌": sym, "↔️": "🔁 Rebalance ערך",
+                        "💰": f"{lp2:.3f}",
+                        "📊": f"⚖️ {weight:.0f}%→{rb_pct:.0f}%",
+                        "🏷️": _asset_type(sym),
+                    })
+                    logger.info(f"val_agent: rebalance {sym} {weight:.0f}%→{rb_pct:.0f}%")
+                    if new_qty > 0.0001:
+                        rebalanced_port.append({**item, "Qty": round(new_qty, 4)})
+                else:
+                    rebalanced_port.append(item)
+            portfolio = rebalanced_port
 
         # ── Market Regime — אל תקנה בשוק דובי ────────────────────────────
         regime = _get_regime_bg()
@@ -319,12 +376,13 @@ def run_val_agent():
                 alloc = min(_ml_position_size(sym, base), cash * 0.20)
                 qty   = alloc / price
                 portfolio.append({
-                    "Symbol":    sym,
-                    "BuyPrice":  _safe(price),
-                    "Qty":       _safe(qty),
-                    "BuyDate":   datetime.now().isoformat(),
-                    "Score":     int(row["Score"]),
-                    "Type":      _asset_type(sym),
+                    "Symbol":       sym,
+                    "BuyPrice":     _safe(price),
+                    "TrailingHigh": _safe(price),
+                    "Qty":          _safe(qty),
+                    "BuyDate":      datetime.now().isoformat(),
+                    "Score":        int(row["Score"]),
+                    "Type":         _asset_type(sym),
                 })
                 cash -= alloc
                 existing.add(sym)
@@ -360,7 +418,7 @@ def run_day_agent():
         tp_pct = float(load("day_tp_pct", 4))
         sl_pct = float(load("day_sl_pct", 2))
 
-        # ── סגור פוזיציות שהגיעו ל-TP או SL ─────────────────────────────
+        # ── סגור פוזיציות שהגיעו ל-TP או Trailing-SL ────────────────────
         new_port = []
         for item in portfolio:
             sym       = item.get("Symbol") or item.get("Stock", "")
@@ -369,6 +427,11 @@ def run_day_agent():
             row       = df[df["Symbol"] == sym]
             lp        = float(row["Price"].iloc[0]) if not row.empty else buy_price
             if buy_price > 0 and qty > 0:
+                trail_high = float(item.get("TrailingHigh", buy_price))
+                if lp > trail_high:
+                    trail_high = lp
+                    item = {**item, "TrailingHigh": round(trail_high, 4)}
+                trail_sl_price = trail_high * (1 - sl_pct / 100)
                 profit = ((lp / buy_price) - 1) * 100
                 if profit >= tp_pct:
                     cash += lp * qty
@@ -379,19 +442,70 @@ def run_day_agent():
                         "🏷️": _asset_type(sym),
                     })
                     logger.info(f"day_agent: TP {sym} +{profit:.1f}%")
+                    try:
+                        from rl_feedback import record_trade_outcome
+                        record_trade_outcome(sym, profit, "TP", "day", buy_price, lp)
+                    except Exception:
+                        pass
                     continue
-                if profit <= -sl_pct:
+                if lp <= trail_sl_price:
+                    trail_dd = ((lp / trail_high) - 1) * 100
                     cash += lp * qty
                     trades_log.insert(0, {
                         "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "📌": sym, "↔️": f"🛑 Stop-Loss ({sl_pct}%)",
-                        "💰": f"{lp:.3f}", "📊": f"{profit:.1f}%",
+                        "📌": sym, "↔️": f"🛑 Trailing-SL ({sl_pct}%)",
+                        "💰": f"{lp:.3f}",
+                        "📊": f"{profit:.1f}% | ↘️{trail_dd:.1f}% מ-{trail_high:.3f}",
                         "🏷️": _asset_type(sym),
                     })
-                    logger.info(f"day_agent: SL {sym} {profit:.1f}%")
+                    logger.info(f"day_agent: Trailing-SL {sym} {profit:.1f}% (peak {trail_high:.3f})")
+                    try:
+                        from rl_feedback import record_trade_outcome
+                        record_trade_outcome(sym, profit, "SL", "day", buy_price, lp)
+                    except Exception:
+                        pass
                     continue
             new_port.append(item)
         portfolio = new_port
+
+        # ── Rebalance — יומי מחמיר יותר (ברירת מחדל 25%) ─────────────────
+        rb_pct = float(load("day_rebalance_pct", 25))
+        positions_value = sum(
+            (float(df[df["Symbol"]==p.get("Symbol","")]["Price"].iloc[0])
+             if not df[df["Symbol"]==p.get("Symbol","")].empty
+             else float(p.get("BuyPrice",0)))
+            * float(p.get("Qty",0))
+            for p in portfolio
+        )
+        total_val = positions_value + cash
+        if total_val > 0:
+            target_val = total_val * (rb_pct / 100)
+            rebalanced_port = []
+            for item in portfolio:
+                sym = item.get("Symbol","")
+                row2 = df[df["Symbol"] == sym]
+                lp2  = float(row2["Price"].iloc[0]) if not row2.empty else float(item.get("BuyPrice",0))
+                qty2 = float(item.get("Qty",0))
+                pos_val = lp2 * qty2
+                weight  = pos_val / total_val * 100
+                if weight > rb_pct and lp2 > 0 and qty2 > 0:
+                    sell_val = pos_val - target_val
+                    sell_qty = sell_val / lp2
+                    new_qty  = qty2 - sell_qty
+                    cash += sell_val
+                    trades_log.insert(0, {
+                        "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "📌": sym, "↔️": "🔁 Rebalance יומי",
+                        "💰": f"{lp2:.3f}",
+                        "📊": f"⚖️ {weight:.0f}%→{rb_pct:.0f}%",
+                        "🏷️": _asset_type(sym),
+                    })
+                    logger.info(f"day_agent: rebalance {sym} {weight:.0f}%→{rb_pct:.0f}%")
+                    if new_qty > 0.0001:
+                        rebalanced_port.append({**item, "Qty": round(new_qty, 4)})
+                else:
+                    rebalanced_port.append(item)
+            portfolio = rebalanced_port
 
         # ── Market Regime ──────────────────────────────────────────────────
         regime = _get_regime_bg()
@@ -463,11 +577,12 @@ def run_day_agent():
                 alloc = min(_ml_position_size(sym, base, hours_back=24), cash * 0.30)
                 qty   = alloc / price
                 portfolio.append({
-                    "Symbol":   sym,
-                    "BuyPrice": _safe(price),
-                    "Qty":      _safe(qty),
-                    "BuyDate":  datetime.now().isoformat(),
-                    "Type":     _asset_type(sym),
+                    "Symbol":       sym,
+                    "BuyPrice":     _safe(price),
+                    "TrailingHigh": _safe(price),
+                    "Qty":          _safe(qty),
+                    "BuyDate":      datetime.now().isoformat(),
+                    "Type":         _asset_type(sym),
                 })
                 cash -= alloc
                 existing.add(sym)
