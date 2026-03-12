@@ -741,41 +741,65 @@ class UltraAdvancedScheduler:
         """Alias used by some UI components."""
         self.run_ml_agent()
 
-    def _run_in_thread(self, fn, name: str):
-        """מריץ פונקציה ב-thread נפרד כדי לא לחסום את loop הראשי."""
-        t = threading.Thread(target=fn, daemon=True, name=name)
-        t.start()
-
     def _loop(self):
-        # ── דחיית הריצה הראשונה — מניעת עומס על yfinance עם טעינת האפליקציה ──
-        # val_agent  : ריצה ראשונה אחרי 5 דקות   → אחר כך כל 6 שעות
-        # day_agent  : ריצה ראשונה אחרי 10 דקות  → אחר כך כל 4 שעות
-        # ml_agent   : ריצה ראשונה אחרי 20 דקות  → אחר כך כל 24 שעות
-        now0 = time.time()
-        last_val = now0 - (6 * 3600 - 5  * 60)   # עוד 5 דקות לריצה ראשונה
-        last_day = now0 - (4 * 3600 - 10 * 60)   # עוד 10 דקות
-        last_ml  = now0 - (24 * 3600 - 20 * 60)  # עוד 20 דקות
-        logger.info("Scheduler loop: first val in 5m, day in 10m, ml in 20m")
+        # ── מרווחים ארוכים + ריצה ראשונה דחויה — מניעת עומס משאבים ──
+        # val_agent : ריצה ראשונה אחרי 10 דקות  → כל 12 שעות
+        # day_agent : ריצה ראשונה אחרי 20 דקות  → כל 8 שעות
+        # ml_agent  : ריצה ראשונה אחרי 30 דקות  → כל 48 שעות
+        # הסוכנים רצים בזה אחר זה (לא במקביל) — מנע spike זיכרון
+        import gc
+        now0     = time.time()
+        last_val = now0 - (12 * 3600 - 10 * 60)
+        last_day = now0 - (8  * 3600 - 20 * 60)
+        last_ml  = now0 - (48 * 3600 - 30 * 60)
+        logger.info("Scheduler: val in 10m / day in 20m / ml in 30m")
 
         while self.running:
             try:
                 now = time.time()
-                # ── סוכן ערך: כל 6 שעות ──────────────────────────────
-                if now - last_val > 6 * 3600:
-                    self._run_in_thread(self.run_val_agent, "val_agent")
-                    last_val = now
-                # ── סוכן יומי: כל 4 שעות ────────────────────────────
-                if now - last_day > 4 * 3600:
-                    self._run_in_thread(self.run_day_agent, "day_agent")
-                    last_day = now
-                # ── ML: פעם ביום ─────────────────────────────────────
-                if now - last_ml > 24 * 3600:
-                    self._run_in_thread(self.run_ml_agent, "ml_agent")
-                    last_ml = now
-                time.sleep(60)
+
+                # ── סוכן ערך: כל 12 שעות ─────────────────────────────
+                if now - last_val > 12 * 3600:
+                    logger.info("scheduler: running val_agent...")
+                    try:
+                        self.run_val_agent()
+                    except Exception as ev:
+                        logger.error(f"val_agent error: {ev}")
+                    last_val = time.time()
+                    gc.collect()
+                    time.sleep(120)          # נשום בין סוכן לסוכן
+                    if not self.running:
+                        break
+
+                # ── סוכן יומי: כל 8 שעות ─────────────────────────────
+                if time.time() - last_day > 8 * 3600:
+                    logger.info("scheduler: running day_agent...")
+                    try:
+                        self.run_day_agent()
+                    except Exception as ed:
+                        logger.error(f"day_agent error: {ed}")
+                    last_day = time.time()
+                    gc.collect()
+                    time.sleep(120)
+                    if not self.running:
+                        break
+
+                # ── ML: כל 48 שעות ────────────────────────────────────
+                if time.time() - last_ml > 48 * 3600:
+                    logger.info("scheduler: running ml_agent...")
+                    try:
+                        self.run_ml_agent()
+                    except Exception as em:
+                        logger.error(f"ml_agent error: {em}")
+                    last_ml = time.time()
+                    gc.collect()
+
+                # ── בדוק שוב בעוד 5 דקות (לא 60 שניות) ───────────────
+                time.sleep(300)
+
             except Exception as e:
                 logger.error(f"scheduler loop error: {e}")
-                time.sleep(60)
+                time.sleep(300)
 
     def start(self):
         if self.running:
