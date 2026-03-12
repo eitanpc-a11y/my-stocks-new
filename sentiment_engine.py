@@ -6,6 +6,7 @@ import yfinance as yf
 from datetime import datetime
 from storage import load, save
 from shared_signals import write_signal
+from api_cache import cached_api_call, throttle
 
 try:
     from textblob import TextBlob
@@ -65,7 +66,7 @@ def score_headline(title: str) -> float:
     return round(_keyword_score(title), 3)
 
 
-def analyze_symbol(symbol: str, max_news: int = 8) -> dict:
+def analyze_symbol(symbol: str, max_news: int = 8, _ttl: int = 3600) -> dict:
     """
     מנתח סנטימנט חדשות לסימול נתון.
     
@@ -79,7 +80,13 @@ def analyze_symbol(symbol: str, max_news: int = 8) -> dict:
         label: "שורי חזק" / "שורי" / "ניטרלי" / "דובי" / "דובי חזק"
     }
     """
+    # קאש 1 שעה — חדשות לא משתנות כל דקה
+    cached_val, hit = __import__("api_cache").cache_get(f"sentiment_{symbol}", ttl=_ttl)
+    if hit:
+        return cached_val
+
     try:
+        throttle("yfinance", 1.0)
         news_items = yf.Ticker(symbol).news or []
     except Exception:
         news_items = []
@@ -133,7 +140,7 @@ def analyze_symbol(symbol: str, max_news: int = 8) -> dict:
         label      = "ניטרלי"
         confidence = max(0, 50 - abs(normalized - 50))
 
-    return {
+    result = {
         "symbol":     symbol,
         "score":      normalized,
         "direction":  direction,
@@ -145,6 +152,8 @@ def analyze_symbol(symbol: str, max_news: int = 8) -> dict:
         "bear_count": bear_count,
         "raw_avg":    round(raw_avg, 3),
     }
+    __import__("api_cache").cache_set(f"sentiment_{symbol}", result)
+    return result
 
 
 def analyze_and_publish(symbol: str) -> dict:

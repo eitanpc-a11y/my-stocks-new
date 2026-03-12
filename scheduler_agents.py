@@ -8,6 +8,7 @@ import yfinance as yf
 import logging
 from datetime import datetime
 from storage import load, save
+from api_cache import cached_api_call, throttle
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +63,11 @@ def _fetch_price_and_rsi(symbol: str) -> dict | None:
 
 
 def _fetch_universe(symbols: list) -> pd.DataFrame:
-    """Fetch data for a list of symbols. Returns DataFrame."""
+    """Fetch data for a list of symbols. Returns DataFrame. מוגן מ-rate-limit."""
     results = []
     for sym in symbols:
         try:
+            throttle("yfinance", 0.8)   # 0.8 שניות בין סימולים — מניעת 429
             d = _fetch_price_and_rsi(sym)
             if d:
                 results.append(d)
@@ -100,15 +102,16 @@ def _safe(val):
 def _has_earnings_soon(symbol: str, days: int = 7) -> bool:
     """
     מחזיר True אם למניה יש דוחות כספיים בתוך `days` ימים.
-    לא רלוונטי לקריפטו ו-ETF.
+    קאש: 24 שעות — דוחות לא משתנים כל שעה.
     """
-    if "-USD" in symbol or symbol in ("XLE","USO","GLD","SLV","UNG"):
+    if "-USD" in symbol or symbol in ("XLE", "USO", "GLD", "SLV", "UNG"):
         return False
-    try:
+
+    def _fetch():
+        throttle("yfinance", 1.0)
         cal = yf.Ticker(symbol).calendar
         if cal is None or cal.empty:
             return False
-        # Earnings Date עשוי להיות עמודה או שורה
         if isinstance(cal, pd.DataFrame):
             if "Earnings Date" in cal.index:
                 earn_date = cal.loc["Earnings Date"].iloc[0]
@@ -118,14 +121,14 @@ def _has_earnings_soon(symbol: str, days: int = 7) -> bool:
                 return False
         else:
             return False
-
         if pd.isna(earn_date):
             return False
         earn_date = pd.to_datetime(earn_date).date()
-        delta     = (earn_date - datetime.now().date()).days
+        delta = (earn_date - datetime.now().date()).days
         return 0 <= delta <= days
-    except Exception:
-        return False
+
+    result = cached_api_call(f"earnings_{symbol}", _fetch, ttl=86400)
+    return bool(result)
 
 
 # ─── ML Confidence → Position Size ──────────────────────────────────────────
@@ -160,14 +163,20 @@ def _ml_position_size(symbol: str, base_alloc: float,
 def _get_regime_bg() -> dict:
     """
     בודק מצב שוק: VIX + SPY/MA50.
-    מחזיר dict עם regime: 'bull'|'neutral'|'bear' ו-vix.
+    קאש: 10 דקות — מספיק לסוכנים, מונע קריאות כפולות.
     """
+    cached, hit = __import__("api_cache").cache_get("regime_bg", ttl=600)
+    if hit:
+        return cached
+
     try:
+        throttle("yfinance", 1.0)
         vix = float(yf.Ticker("^VIX").history(period="2d")["Close"].iloc[-1])
     except Exception:
         vix = 20.0
 
     try:
+        throttle("yfinance", 1.0)
         spy_hist       = yf.Ticker("SPY").history(period="3mo")
         spy            = float(spy_hist["Close"].iloc[-1])
         ma50           = float(spy_hist["Close"].rolling(50).mean().iloc[-1])
@@ -183,7 +192,9 @@ def _get_regime_bg() -> dict:
         regime = "bull"
 
     logger.info(f"market_regime: {regime} | VIX={vix:.1f} | SPY/MA50={spy_above_ma50}")
-    return {"regime": regime, "vix": vix, "spy_above_ma50": spy_above_ma50}
+    result = {"regime": regime, "vix": vix, "spy_above_ma50": spy_above_ma50}
+    __import__("api_cache").cache_set("regime_bg", result)
+    return result
 
 
 # ─── Value Agent ─────────────────────────────────────────────────────────────
