@@ -63,12 +63,35 @@ AUTO_INTERVALS = {
 
 
 # ─── סריקת מניה בודדת ────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600)  # שעה אחת — הנתונים הפונדמנטליים לא משתנים לעתים קרובות
-def _scan_single(ticker: str) -> dict | None:
+# ── LAYER 1: Fundamentals — cached 24 hours ──────────────────────────────────
+@st.cache_data(ttl=86400)
+def _scan_fundamentals(ticker: str) -> dict:
+    """רק .info — משתנה רבעונית (cache 24 שעות)."""
     try:
-        s   = yf.Ticker(ticker)
-        inf = s.info
-        h   = s.history(period="3mo")
+        inf = yf.Ticker(ticker).info or {}
+        return {
+            "rev_growth":  (inf.get("revenueGrowth")       or 0) * 100,
+            "earn_growth": (inf.get("earningsGrowth")      or 0) * 100,
+            "margin":      (inf.get("profitMargins")       or 0) * 100,
+            "roe":         (inf.get("returnOnEquity")      or 0) * 100,
+            "cash":         inf.get("totalCash", 0)        or 0,
+            "debt":         inf.get("totalDebt", 0)        or 0,
+            "div_yield":   (inf.get("dividendYield")       or 0) * 100,
+            "payout":      (inf.get("payoutRatio")         or 0) * 100,
+            "insider_pct": (inf.get("heldPercentInsiders") or 0) * 100,
+            "target_px":    inf.get("targetMeanPrice", 0)  or 0,
+        }
+    except Exception:
+        return {"rev_growth":0,"earn_growth":0,"margin":0,"roe":0,
+                "cash":0,"debt":0,"div_yield":0,"payout":0,"insider_pct":0,"target_px":0}
+
+
+# ── LAYER 2: Price & Technicals — cached 10 minutes ──────────────────────────
+@st.cache_data(ttl=600)
+def _scan_technical(ticker: str) -> dict | None:
+    """OHLCV + RSI + תשואות — מחיר (cache 10 דקות)."""
+    try:
+        h = yf.Ticker(ticker).history(period="3mo")
         if h.empty or len(h) < 15:
             return None
         px = float(h["Close"].iloc[-1])
@@ -80,82 +103,87 @@ def _scan_single(ticker: str) -> dict | None:
         loss  = (-delta.where(delta < 0, 0)).rolling(14).mean().replace(0, 1e-10)
         rsi   = float(100 - (100 / (1 + (gain / loss).iloc[-1])))
 
-        chg1d = float(((px / h["Close"].iloc[-2]) - 1) * 100) if len(h) >= 2  else 0
-        chg1m = float(((px / h["Close"].iloc[-22])- 1) * 100) if len(h) >= 22 else 0
-        chg3m = float(((px / h["Close"].iloc[0])  - 1) * 100) if len(h) >= 1 else 0
-
-        rev_growth  = (inf.get("revenueGrowth")        or 0) * 100
-        earn_growth = (inf.get("earningsGrowth")       or 0) * 100
-        margin      = (inf.get("profitMargins")        or 0) * 100
-        roe         = (inf.get("returnOnEquity")       or 0) * 100
-        cash        =  inf.get("totalCash",  0)        or 0
-        debt        =  inf.get("totalDebt",  0)        or 0
-        div_yield   = (inf.get("dividendYield")        or 0) * 100
-        payout      = (inf.get("payoutRatio")          or 0) * 100
-        insider_pct = (inf.get("heldPercentInsiders")  or 0) * 100
-        target_px   =  inf.get("targetMeanPrice", 0)  or 0
-        upside      = float(((target_px / px) - 1) * 100) if px > 0 and target_px > 0 else 0
-        volume      = int(h["Volume"].iloc[-1]) if not h["Volume"].empty else 0
-
-        score = sum([
-            rev_growth  >= 10,
-            earn_growth >= 10,
-            margin      >= 10,
-            roe         >= 15,
-            cash > debt,
-            debt == 0,
-        ])
-
-        short_score = 0
-        if rsi < 35:            short_score += 3
-        elif rsi < 45:          short_score += 2
-        if chg1m < -8:          short_score += 2
-        elif chg1m < -4:        short_score += 1
-        if upside > 15:         short_score += 2
-        if rev_growth > 15:     short_score += 1
-        if volume > 1_000_000:  short_score += 1
-
-        long_score  = score
-        long_score += 2 if rev_growth  >= 20 else (1 if rev_growth  >= 10 else 0)
-        long_score += 2 if earn_growth >= 20 else (1 if earn_growth >= 10 else 0)
-        long_score += 2 if upside > 20 else (1 if upside > 10 else 0)
-        if div_yield > 2 and payout < 60 and cash > debt:
-            long_score += 2
-        if insider_pct >= 5:  long_score += 1
-        if chg3m > 10:        long_score += 1
-
-        currency = "אג'" if str(ticker).endswith(".TA") else "$"
         return {
-            "Symbol":       ticker,
-            "Price":        px,
-            "PriceStr":     f"{currency}{px:,.2f}",
-            "Currency":     currency,
-            "RSI":          round(rsi, 1),
-            "Chg1D":        round(chg1d, 2),
-            "Chg1M":        round(chg1m, 2),
-            "Chg3M":        round(chg3m, 2),
-            "Score":        score,
-            "ShortScore":   short_score,
-            "LongScore":    long_score,
-            "RevGrowth":    round(rev_growth, 1),
-            "EarnGrowth":   round(earn_growth, 1),
-            "Margin":       round(margin, 1),
-            "ROE":          round(roe, 1),
-            "DivYield":     round(div_yield, 2),
-            "PayoutRatio":  round(payout, 1),
-            "InsiderHeld":  round(insider_pct, 1),
-            "TargetUpside": round(upside, 1),
-            "CashVsDebt":   "✅" if cash > debt else "❌",
-            "Volume":       volume,
-            "Action": (
-                "קנייה חזקה 💎" if long_score >= 10 else
-                "קנייה 📈"      if long_score >= 7  else
-                "החזק ⚖️"       if long_score >= 4  else
-                "בבדיקה 🔍"
-            ),
+            "px":    px,
+            "rsi":   round(rsi, 1),
+            "chg1d": round(float(((px / h["Close"].iloc[-2]) - 1) * 100) if len(h) >= 2  else 0, 2),
+            "chg1m": round(float(((px / h["Close"].iloc[-22])- 1) * 100) if len(h) >= 22 else 0, 2),
+            "chg3m": round(float(((px / h["Close"].iloc[0])  - 1) * 100) if len(h) >= 1  else 0, 2),
+            "volume": int(h["Volume"].iloc[-1]) if not h["Volume"].empty else 0,
         }
     except Exception:
         return None
+
+
+# ── COMBINER ─────────────────────────────────────────────────────────────────
+def _scan_single(ticker: str) -> dict | None:
+    """ממזג פונדמנטלים (24ש) + מחיר/טכני (10 דק) — ללא cache נוסף."""
+    tec = _scan_technical(ticker)
+    if tec is None:
+        return None
+    fun = _scan_fundamentals(ticker)
+
+    px          = tec["px"]
+    rsi         = tec["rsi"]
+    cash, debt  = fun["cash"], fun["debt"]
+    rev_growth  = fun["rev_growth"]
+    earn_growth = fun["earn_growth"]
+    div_yield   = fun["div_yield"]
+    payout      = fun["payout"]
+    insider_pct = fun["insider_pct"]
+    target_px   = fun["target_px"]
+    upside      = ((target_px / px) - 1) * 100 if px > 0 and target_px > 0 else 0
+
+    score = sum([rev_growth >= 10, earn_growth >= 10, fun["margin"] >= 10,
+                 fun["roe"] >= 15, cash > debt, debt == 0])
+
+    short_score = 0
+    if rsi < 35:                  short_score += 3
+    elif rsi < 45:                short_score += 2
+    if tec["chg1m"] < -8:        short_score += 2
+    elif tec["chg1m"] < -4:      short_score += 1
+    if upside > 15:               short_score += 2
+    if rev_growth > 15:           short_score += 1
+    if tec["volume"] > 1_000_000: short_score += 1
+
+    long_score = score
+    long_score += 2 if rev_growth  >= 20 else (1 if rev_growth  >= 10 else 0)
+    long_score += 2 if earn_growth >= 20 else (1 if earn_growth >= 10 else 0)
+    long_score += 2 if upside > 20 else (1 if upside > 10 else 0)
+    if div_yield > 2 and payout < 60 and cash > debt: long_score += 2
+    if insider_pct >= 5:  long_score += 1
+    if tec["chg3m"] > 10: long_score += 1
+
+    currency = "אג'" if str(ticker).endswith(".TA") else "$"
+    return {
+        "Symbol":       ticker,
+        "Price":        px,
+        "PriceStr":     f"{currency}{px:,.2f}",
+        "Currency":     currency,
+        "RSI":          rsi,
+        "Chg1D":        tec["chg1d"],
+        "Chg1M":        tec["chg1m"],
+        "Chg3M":        tec["chg3m"],
+        "Score":        score,
+        "ShortScore":   short_score,
+        "LongScore":    long_score,
+        "RevGrowth":    round(rev_growth, 1),
+        "EarnGrowth":   round(earn_growth, 1),
+        "Margin":       round(fun["margin"], 1),
+        "ROE":          round(fun["roe"], 1),
+        "DivYield":     round(div_yield, 2),
+        "PayoutRatio":  round(payout, 1),
+        "InsiderHeld":  round(insider_pct, 1),
+        "TargetUpside": round(upside, 1),
+        "CashVsDebt":   "✅" if cash > debt else "❌",
+        "Volume":       tec["volume"],
+        "Action": (
+            "קנייה חזקה 💎" if long_score >= 10 else
+            "קנייה 📈"      if long_score >= 7  else
+            "החזק ⚖️"       if long_score >= 4  else
+            "בבדיקה 🔍"
+        ),
+    }
 
 
 # ─── סריקה מקבילית (ללא cache — כי אנחנו מנהלים את ה-TTL ידנית) ─────────────
