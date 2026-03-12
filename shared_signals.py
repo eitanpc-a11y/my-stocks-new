@@ -113,6 +113,31 @@ def get_consensus(symbol: str, hours_back: int = 24) -> dict:
     }
 
 
+def check_consensus_buy(symbol: str, min_sources: int = 2,
+                        min_confidence: float = 60, hours_back: int = 48) -> dict:
+    """
+    מחזיר True רק אם ≥ min_sources מקורות שונים ממליצים BUY.
+    זה הלב של Consensus Voting — אל תקנה לבד!
+    
+    דוגמה: min_sources=2 → ML + טכני חייבים שניהם להסכים.
+    """
+    sigs = read_signals(symbol=symbol, direction="BUY",
+                        min_confidence=min_confidence, hours_back=hours_back)
+    sources = list({s["🤖"] for s in sigs})
+    avg_conf = round(sum(s["🎯"] for s in sigs) / len(sigs), 1) if sigs else 0
+    approved = len(sources) >= min_sources
+
+    return {
+        "approved":   approved,
+        "sources":    sources,
+        "n_sources":  len(sources),
+        "avg_conf":   avg_conf,
+        "n_signals":  len(sigs),
+        "reason":     f"{len(sources)}/{min_sources} מקורות" if approved
+                      else f"רק {len(sources)}/{min_sources} מקורות — חסר קונצנזוס",
+    }
+
+
 def get_top_buys(timeframe: str = None, min_confidence: float = 60,
                  hours_back: int = 24, limit: int = 10) -> list:
     """מחזיר רשימת נכסים עם הכי הרבה סיגנלי קנייה."""

@@ -96,77 +96,201 @@ def _safe(val):
     return val
 
 
+# ─── Earnings Calendar — הימנע מרבעוניים בשבוע הקרוב ───────────────────────
+def _has_earnings_soon(symbol: str, days: int = 7) -> bool:
+    """
+    מחזיר True אם למניה יש דוחות כספיים בתוך `days` ימים.
+    לא רלוונטי לקריפטו ו-ETF.
+    """
+    if "-USD" in symbol or symbol in ("XLE","USO","GLD","SLV","UNG"):
+        return False
+    try:
+        cal = yf.Ticker(symbol).calendar
+        if cal is None or cal.empty:
+            return False
+        # Earnings Date עשוי להיות עמודה או שורה
+        if isinstance(cal, pd.DataFrame):
+            if "Earnings Date" in cal.index:
+                earn_date = cal.loc["Earnings Date"].iloc[0]
+            elif "Earnings Date" in cal.columns:
+                earn_date = cal["Earnings Date"].iloc[0]
+            else:
+                return False
+        else:
+            return False
+
+        if pd.isna(earn_date):
+            return False
+        earn_date = pd.to_datetime(earn_date).date()
+        delta     = (earn_date - datetime.now().date()).days
+        return 0 <= delta <= days
+    except Exception:
+        return False
+
+
+# ─── ML Confidence → Position Size ──────────────────────────────────────────
+def _ml_position_size(symbol: str, base_alloc: float,
+                      hours_back: int = 48) -> float:
+    """
+    מכפיל את הקצאת ההון לפי ביטחון ה-ML:
+      conf ≥ 80%  → x1.5 (עד 150% מהבסיס)
+      conf 65-80% → x1.0
+      conf 50-65% → x0.7
+      ללא ML       → x0.8 (ספקנות)
+    """
+    try:
+        from shared_signals import read_signals
+        sigs = read_signals(symbol=symbol, direction="BUY",
+                            min_confidence=50, hours_back=hours_back, limit=5)
+        if not sigs:
+            return base_alloc * 0.8
+        avg_conf = sum(s["🎯"] for s in sigs) / len(sigs)
+        if avg_conf >= 80:
+            multiplier = 1.5
+        elif avg_conf >= 65:
+            multiplier = 1.0
+        else:
+            multiplier = 0.7
+        return base_alloc * multiplier
+    except Exception:
+        return base_alloc
+
+
+# ─── Market Regime (ללא st.cache — רץ בתהליך רקע) ───────────────────────────
+def _get_regime_bg() -> dict:
+    """
+    בודק מצב שוק: VIX + SPY/MA50.
+    מחזיר dict עם regime: 'bull'|'neutral'|'bear' ו-vix.
+    """
+    try:
+        vix = float(yf.Ticker("^VIX").history(period="2d")["Close"].iloc[-1])
+    except Exception:
+        vix = 20.0
+
+    try:
+        spy_hist       = yf.Ticker("SPY").history(period="3mo")
+        spy            = float(spy_hist["Close"].iloc[-1])
+        ma50           = float(spy_hist["Close"].rolling(50).mean().iloc[-1])
+        spy_above_ma50 = spy > ma50
+    except Exception:
+        spy_above_ma50 = True
+
+    if vix > 30 or not spy_above_ma50:
+        regime = "bear"
+    elif vix > 20:
+        regime = "neutral"
+    else:
+        regime = "bull"
+
+    logger.info(f"market_regime: {regime} | VIX={vix:.1f} | SPY/MA50={spy_above_ma50}")
+    return {"regime": regime, "vix": vix, "spy_above_ma50": spy_above_ma50}
+
+
 # ─── Value Agent ─────────────────────────────────────────────────────────────
 def run_val_agent():
-    """Buys quality assets across all classes, sells at +20% or -10%."""
+    """Buys quality assets. Uses stored TP/SL. Skips buy in bear market."""
     logger.info("val_agent: starting run")
     try:
         symbols = USA + ISRAEL + ENERGY + CRYPTO[:3]
-        df = _fetch_universe(symbols)
+        df      = _fetch_universe(symbols)
         if df.empty:
             logger.warning("val_agent: no data received")
             return
 
-        portfolio   = load("val_portfolio", [])
-        cash        = float(load("val_cash_ils", 100000.0))
-        trades_log  = load("val_trades_log", [])
+        portfolio  = load("val_portfolio", [])
+        cash       = float(load("val_cash_ils", 100000.0))
+        trades_log = load("val_trades_log", [])
 
-        # ── Sell: +20% profit OR -10% stop-loss ────────────────────────────
+        # קרא הגדרות TP/SL שהמשתמש הגדיר ב-UI
+        tp_pct = float(load("val_tp_pct", 20))
+        sl_pct = float(load("val_sl_pct", 10))
+
+        # ── Sell: TP או SL ─────────────────────────────────────────────────
         new_port = []
         for item in portfolio:
-            sym       = item.get("Stock", "")
+            sym       = item.get("Symbol") or item.get("Stock", "")
             buy_price = float(item.get("BuyPrice", 0))
-            qty       = float(item.get("Quantity", 0))
+            qty       = float(item.get("Qty") or item.get("Quantity", 0))
             row       = df[df["Symbol"] == sym]
             lp        = float(row["Price"].iloc[0]) if not row.empty else buy_price
             if buy_price > 0 and qty > 0:
                 profit = ((lp / buy_price) - 1) * 100
-                if profit >= 20:
+                if profit >= tp_pct:
                     cash += lp * qty
                     trades_log.insert(0, {
                         "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "📌": sym, "↔️": "מכירה-רווח",
+                        "📌": sym, "↔️": f"🎯 Take-Profit ({tp_pct}%)",
                         "💰": f"{lp:.3f}", "📊": f"+{profit:.1f}%",
                         "🏷️": _asset_type(sym),
                     })
+                    logger.info(f"val_agent: TP {sym} +{profit:.1f}%")
                     continue
-                if profit <= -10:
+                if profit <= -sl_pct:
                     cash += lp * qty
                     trades_log.insert(0, {
                         "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "📌": sym, "↔️": "סטופ-לוס",
+                        "📌": sym, "↔️": f"🛑 Stop-Loss ({sl_pct}%)",
                         "💰": f"{lp:.3f}", "📊": f"{profit:.1f}%",
                         "🏷️": _asset_type(sym),
                     })
+                    logger.info(f"val_agent: SL {sym} {profit:.1f}%")
                     continue
             new_port.append(item)
         portfolio = new_port
 
-        # ── Buy: score ≥ 3, RSI < 65, up to 8 positions ───────────────────
+        # ── Market Regime — אל תקנה בשוק דובי ────────────────────────────
+        regime = _get_regime_bg()
+        if regime["regime"] == "bear":
+            logger.info("val_agent: bear market — skipping buys")
+            save("val_portfolio",  portfolio)
+            save("val_cash_ils",   _safe(cash))
+            save("val_trades_log", trades_log[:200])
+            return
+
+        # ── Position sizing לפי מצב שוק ───────────────────────────────────
+        alloc_pct = 0.12 if regime["regime"] == "neutral" else 0.15
+
+        # ── Buy: score ≥ 3, RSI < 65, עד 8 פוזיציות ──────────────────────
         if cash > 1000 and len(portfolio) < 8:
-            existing = {p.get("Stock") for p in portfolio}
+            from shared_signals import check_consensus_buy
+            existing   = {p.get("Symbol", p.get("Stock","")) for p in portfolio}
             candidates = df[(df["Score"] >= 3) & (df["RSI"] < 65)].nlargest(4, "Score")
             for _, row in candidates.iterrows():
                 sym   = row["Symbol"]
                 price = float(row["Price"])
                 if sym in existing or price <= 0:
                     continue
-                alloc = cash * 0.15
+
+                # 🗓️ הימנע מרבעוניים — לא נכנסים לפני דוחות
+                if _has_earnings_soon(sym, days=7):
+                    logger.info(f"val_agent: skipping {sym} — earnings soon")
+                    continue
+
+                # 🗳️ Consensus Voting — רק אם ≥2 מקורות מסכימים
+                consensus = check_consensus_buy(sym, min_sources=2, min_confidence=60)
+                if not consensus["approved"]:
+                    logger.info(f"val_agent: skipping {sym} — {consensus['reason']}")
+                    continue
+
+                # 💰 Position Sizing לפי ביטחון ML
+                base  = cash * alloc_pct
+                alloc = min(_ml_position_size(sym, base), cash * 0.20)
                 qty   = alloc / price
                 portfolio.append({
-                    "Stock":     sym,
+                    "Symbol":    sym,
                     "BuyPrice":  _safe(price),
-                    "Quantity":  _safe(qty),
+                    "Qty":       _safe(qty),
                     "BuyDate":   datetime.now().isoformat(),
                     "Score":     int(row["Score"]),
-                    "AssetType": _asset_type(sym),
+                    "Type":      _asset_type(sym),
                 })
                 cash -= alloc
                 existing.add(sym)
                 trades_log.insert(0, {
                     "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "📌": sym, "↔️": "קנייה",
-                    "💰": f"{price:.3f}", "📊": f"ציון {int(row['Score'])}/5",
+                    "💰": f"{price:.3f}",
+                    "📊": f"ציון {int(row['Score'])}/5 | VIX {regime['vix']:.0f} | ML {consensus['avg_conf']:.0f}%",
                     "🏷️": _asset_type(sym),
                 })
 
@@ -180,62 +304,105 @@ def run_val_agent():
 
 # ─── Day Agent ────────────────────────────────────────────────────────────────
 def run_day_agent():
-    """Intraday agent: buys RSI dips, closes at ±2%."""
+    """Intraday agent. Uses stored TP/SL. Skips buy when VIX>30."""
     logger.info("day_agent: starting run")
     try:
         symbols = USA[:6] + CRYPTO[:3] + ENERGY[:3] + ISRAEL[:2]
-        df = _fetch_universe(symbols)
+        df      = _fetch_universe(symbols)
 
         portfolio  = load("day_portfolio", [])
         cash       = float(load("day_cash_ils", 100000.0))
         trades_log = load("day_trades_log", [])
 
-        # ── Close open positions ≥ ±2% ────────────────────────────────────
+        # קרא הגדרות TP/SL
+        tp_pct = float(load("day_tp_pct", 4))
+        sl_pct = float(load("day_sl_pct", 2))
+
+        # ── סגור פוזיציות שהגיעו ל-TP או SL ─────────────────────────────
         new_port = []
         for item in portfolio:
-            sym       = item.get("Stock", "")
+            sym       = item.get("Symbol") or item.get("Stock", "")
             buy_price = float(item.get("BuyPrice", 0))
-            qty       = float(item.get("Quantity", 0))
+            qty       = float(item.get("Qty") or item.get("Quantity", 0))
             row       = df[df["Symbol"] == sym]
             lp        = float(row["Price"].iloc[0]) if not row.empty else buy_price
             if buy_price > 0 and qty > 0:
                 profit = ((lp / buy_price) - 1) * 100
-                if abs(profit) >= 2:
+                if profit >= tp_pct:
                     cash += lp * qty
                     trades_log.insert(0, {
                         "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "📌": sym, "↔️": "סגירה-יומי",
-                        "💰": f"{lp:.3f}", "📊": f"{profit:+.1f}%",
+                        "📌": sym, "↔️": f"🎯 Take-Profit ({tp_pct}%)",
+                        "💰": f"{lp:.3f}", "📊": f"+{profit:.1f}%",
                         "🏷️": _asset_type(sym),
                     })
+                    logger.info(f"day_agent: TP {sym} +{profit:.1f}%")
+                    continue
+                if profit <= -sl_pct:
+                    cash += lp * qty
+                    trades_log.insert(0, {
+                        "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "📌": sym, "↔️": f"🛑 Stop-Loss ({sl_pct}%)",
+                        "💰": f"{lp:.3f}", "📊": f"{profit:.1f}%",
+                        "🏷️": _asset_type(sym),
+                    })
+                    logger.info(f"day_agent: SL {sym} {profit:.1f}%")
                     continue
             new_port.append(item)
         portfolio = new_port
 
+        # ── Market Regime ──────────────────────────────────────────────────
+        regime = _get_regime_bg()
+        if regime["vix"] > 30:
+            logger.info(f"day_agent: VIX={regime['vix']:.1f} > 30 — skipping buys")
+            save("day_portfolio",  portfolio)
+            save("day_cash_ils",   _safe(cash))
+            save("day_trades_log", trades_log[:300])
+            return
+
+        alloc_pct = 0.15 if regime["regime"] == "neutral" else 0.25
+
         # ── Intraday buy: RSI < 40, score ≥ 2 ───────────────────────────
         if not df.empty and cash > 500 and len(portfolio) < 5:
-            existing  = {p.get("Stock") for p in portfolio}
-            signals   = df[(df["RSI"] < 40) & (df["Score"] >= 2)].nlargest(3, "Score")
+            from shared_signals import check_consensus_buy
+            existing = {p.get("Symbol", p.get("Stock","")) for p in portfolio}
+            signals  = df[(df["RSI"] < 40) & (df["Score"] >= 2)].nlargest(3, "Score")
             for _, row in signals.iterrows():
                 sym   = row["Symbol"]
                 price = float(row["Price"])
                 if sym in existing or price <= 0:
                     continue
-                alloc = min(cash * 0.25, cash)
+
+                # 🗓️ הימנע מרבעוניים
+                if _has_earnings_soon(sym, days=5):
+                    logger.info(f"day_agent: skipping {sym} — earnings soon")
+                    continue
+
+                # 🗳️ Consensus Voting (גמיש יותר ביומי — מינימום 1 מקור ML)
+                consensus = check_consensus_buy(sym, min_sources=1,
+                                               min_confidence=55, hours_back=24)
+                if not consensus["approved"]:
+                    logger.info(f"day_agent: skipping {sym} — no ML signal")
+                    continue
+
+                # 💰 Position Sizing לפי ML Confidence
+                base  = cash * alloc_pct
+                alloc = min(_ml_position_size(sym, base, hours_back=24), cash * 0.30)
                 qty   = alloc / price
                 portfolio.append({
-                    "Stock":    sym,
+                    "Symbol":   sym,
                     "BuyPrice": _safe(price),
-                    "Quantity": _safe(qty),
+                    "Qty":      _safe(qty),
                     "BuyDate":  datetime.now().isoformat(),
-                    "AssetType": _asset_type(sym),
+                    "Type":     _asset_type(sym),
                 })
                 cash -= alloc
                 existing.add(sym)
                 trades_log.insert(0, {
                     "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "📌": sym, "↔️": "קנייה-יומי",
-                    "💰": f"{price:.3f}", "📊": f"RSI {row['RSI']:.0f}",
+                    "💰": f"{price:.3f}",
+                    "📊": f"RSI {row['RSI']:.0f} | ML {consensus['avg_conf']:.0f}%",
                     "🏷️": _asset_type(sym),
                 })
 
