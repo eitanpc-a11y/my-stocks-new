@@ -10,6 +10,7 @@ from storage import load, save
 from shared_signals import get_top_buys
 from rl_feedback import record_trade_outcome, should_buy, get_adaptive_confidence_boost
 from sector_diversifier import can_buy_sector, render_sector_breakdown
+from macro_calendar import is_macro_event_soon, next_macro_event
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -124,19 +125,109 @@ def _regime_banner():
 
 
 # ════════════════════════════════════════════════════════════════════════
+# 📊 ANALYTICS — Sharpe, Max Drawdown, Monthly P&L
+# ════════════════════════════════════════════════════════════════════════
+
+def render_analytics(trades: list, initial: float, label: str = ""):
+    """
+    מחשב ומציג לוח Analytics מתקדם מתוך יומן העסקאות.
+    ללא API — כל החישובים על נתונים קיימים.
+    """
+    import streamlit as st
+    import pandas as pd
+    import numpy as np
+
+    closed = [t for t in trades if "קנייה" not in str(t.get("↔️",""))]
+    if not closed:
+        st.info("אין עסקאות סגורות עדיין לניתוח.")
+        return
+
+    # חלץ P&L מהעמודה 📊
+    pnl_vals = []
+    for t in closed:
+        raw = str(t.get("📊","")).replace("%","").replace("+","").split("|")[0].strip()
+        try:
+            pnl_vals.append(float(raw))
+        except Exception:
+            pass
+
+    if not pnl_vals:
+        st.info("אין נתוני P&L מספיקים.")
+        return
+
+    wins   = [v for v in pnl_vals if v > 0]
+    losses = [v for v in pnl_vals if v <= 0]
+    total  = len(pnl_vals)
+    win_rate = len(wins) / total * 100 if total else 0
+    avg_win  = np.mean(wins)  if wins   else 0
+    avg_loss = np.mean(losses) if losses else 0
+    profit_factor = abs(sum(wins) / sum(losses)) if sum(losses) != 0 else float("inf")
+
+    # Max Drawdown — רץ על סדר הרווחים כאילו כל עסקה = שינוי
+    equity = [initial]
+    for v in reversed(pnl_vals):  # reversed = כרונולוגי (inserted at 0)
+        equity.append(equity[-1] * (1 + v / 100))
+    equity_arr = np.array(equity)
+    peak = np.maximum.accumulate(equity_arr)
+    drawdowns = (equity_arr - peak) / peak * 100
+    max_dd = float(np.min(drawdowns))
+
+    # Sharpe Ratio (פשוט — ממוצע / סטיית תקן)
+    if len(pnl_vals) >= 3:
+        sharpe = float(np.mean(pnl_vals) / (np.std(pnl_vals) + 1e-9) * np.sqrt(252 / 20))
+    else:
+        sharpe = 0.0
+
+    # ── Display ───────────────────────────────────────────────────────
+    with st.expander(f"📊 Analytics מתקדם {label}", expanded=False):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("🏆 Win Rate",       f"{win_rate:.0f}%")
+        c2.metric("📈 Avg Win",        f"+{avg_win:.1f}%")
+        c3.metric("📉 Avg Loss",       f"{avg_loss:.1f}%")
+        c4.metric("⚖️ Profit Factor",  f"{profit_factor:.2f}" if profit_factor < 99 else "∞")
+        c5.metric("🎯 Sharpe",         f"{sharpe:.2f}")
+
+        c6, c7 = st.columns(2)
+        c6.metric("🕳️ Max Drawdown",  f"{max_dd:.1f}%",
+                  delta=f"{'⚠️ גבוה' if max_dd < -20 else '✅ סביר'}")
+        c7.metric("📋 סה\"כ עסקאות",  str(total))
+
+        # Monthly P&L
+        monthly: dict = {}
+        for t in closed:
+            ts  = str(t.get("⏰",""))[:7]   # YYYY-MM
+            raw = str(t.get("📊","")).replace("%","").replace("+","").split("|")[0].strip()
+            try:
+                monthly[ts] = monthly.get(ts, 0) + float(raw)
+            except Exception:
+                pass
+        if monthly:
+            df_m = pd.DataFrame([
+                {"📅 חודש": k, "📊 P&L%": round(v, 2),
+                 "🎨": "🟢" if v >= 0 else "🔴"}
+                for k, v in sorted(monthly.items())
+            ])
+            st.dataframe(df_m, hide_index=True, use_container_width=True)
+
+
+# ════════════════════════════════════════════════════════════════════════
 # 🛡️ AUTO EXIT — Stop-Loss & Take-Profit
 # ════════════════════════════════════════════════════════════════════════
 
 def _run_auto_exit(portfolio: list, cash: float, trades: list,
-                   tp_pct: float, sl_pct: float, label_suffix: str = "") -> tuple:
+                   tp_pct: float, sl_pct: float, label_suffix: str = "",
+                   max_hold_days: int = 0) -> tuple:
     """
-    עובר על כל הפוזיציות ומוכר אוטומטית אם הגיעו ל-TP או Trailing-SL.
-    Trailing SL: SL מחושב מהשיא ההיסטורי (TrailingHigh) — לא מהקנייה.
+    עובר על כל הפוזיציות ומוכר אוטומטית אם:
+    1. הגיעו ל-TP
+    2. ירדו מהשיא ביותר מ-sl_pct% (Trailing SL)
+    3. תקועים יותר מ-max_hold_days ימים עם רווח < 2% (Time-Based Exit)
     מחזיר (portfolio_new, cash_new, trades_new, sold_count, report)
     """
     new_port = []
     sold     = 0
     report   = []
+    today    = datetime.now().date()
 
     for p in portfolio:
         lp = _live(p["Symbol"], p.get("BuyPrice", 0))
@@ -151,8 +242,34 @@ def _run_auto_exit(portfolio: list, cash: float, trades: list,
             p = {**p, "TrailingHigh": round(trail_high, 4)}
 
         pnl_pct        = ((lp / bp) - 1) * 100
-        trail_sl_price = trail_high * (1 - sl_pct / 100)   # SL מהשיא
-        trail_drawdown = ((lp / trail_high) - 1) * 100     # ירידה מהשיא
+        trail_sl_price = trail_high * (1 - sl_pct / 100)
+        trail_drawdown = ((lp / trail_high) - 1) * 100
+
+        # ── Time-Based Exit ─────────────────────────────────────────────
+        if max_hold_days > 0 and p.get("BuyDate"):
+            try:
+                buy_date = datetime.fromisoformat(str(p["BuyDate"])).date()
+                hold_days = (today - buy_date).days
+            except Exception:
+                hold_days = 0
+            if hold_days >= max_hold_days and pnl_pct < 2.0:
+                qty = float(p.get("Qty", 0))
+                cash += lp * qty
+                trades.insert(0, {
+                    "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "📌": p["Symbol"],
+                    "↔️": f"⏳ Time-Exit {label_suffix}",
+                    "💰": f"{lp:.3f}",
+                    "📊": f"{pnl_pct:.1f}% | {hold_days}d מהקנייה",
+                    "🏷️": p.get("Type", ""),
+                })
+                report.append(f"⏳ {p['Symbol']} {pnl_pct:.1f}% ({hold_days}d תקוע)")
+                record_trade_outcome(
+                    symbol=p["Symbol"], pnl_pct=pnl_pct, outcome="TIME",
+                    agent=label_suffix.strip(), entry_price=bp, exit_price=lp,
+                )
+                sold += 1
+                continue
 
         if pnl_pct >= tp_pct:
             qty = float(p.get("Qty", 0))
@@ -171,7 +288,6 @@ def _run_auto_exit(portfolio: list, cash: float, trades: list,
             sold += 1
 
         elif lp <= trail_sl_price:
-            # Trailing SL — ירד יותר מ-sl_pct% מהשיא
             qty = float(p.get("Qty", 0))
             cash += lp * qty
             trades.insert(0, {
@@ -280,22 +396,32 @@ def render_value_agent(df_all: pd.DataFrame):
     initial   = float(load("val_initial", 100000.0))
 
     # ── הגדרות Stop-Loss / Take-Profit ──────────────────────────────────
-    with st.expander("⚙️ הגדרות Stop-Loss / Take-Profit / Rebalance", expanded=False):
-        col_tp, col_sl, col_rb = st.columns(3)
-        val_tp = col_tp.slider("🎯 Take-Profit %",     5, 50, 20, 1, key="val_tp_pct",
+    with st.expander("⚙️ הגדרות Stop-Loss / Take-Profit / Rebalance / Time-Exit", expanded=False):
+        col_tp, col_sl = st.columns(2)
+        col_rb, col_te = st.columns(2)
+        val_tp = col_tp.slider("🎯 Take-Profit %",       5, 50, 20, 1, key="val_tp_pct",
                                help="מוכר כשהרווח מגיע לאחוז זה")
-        val_sl = col_sl.slider("🛑 Trailing Stop %",   3, 25, 10, 1, key="val_sl_pct",
+        val_sl = col_sl.slider("🛑 Trailing Stop %",     3, 25, 10, 1, key="val_sl_pct",
                                help="מוכר כשירידה מהשיא מגיעה לאחוז זה")
-        val_rb = col_rb.slider("🔁 Rebalance מקס %",  15, 50, 30, 5, key="val_rebalance_pct",
+        val_rb = col_rb.slider("🔁 Rebalance מקס %",    15, 50, 30, 5, key="val_rebalance_pct",
                                help="מוכר עודף כשפוזיציה חורגת ממשקל זה בתיק")
-        save("val_tp_pct", val_tp)
-        save("val_sl_pct", val_sl)
-        save("val_rebalance_pct", val_rb)
+        val_te = col_te.slider("⏳ Time-Exit (ימים)",    0, 60, 21, 1, key="val_time_exit",
+                               help="מוכר פוזיציה תקועה (רווח < 2%) אחרי N ימים. 0=כבוי")
+        save("val_tp_pct", val_tp); save("val_sl_pct", val_sl)
+        save("val_rebalance_pct", val_rb); save("val_time_exit", val_te)
 
-    # ── Auto Exit — רץ בכל טעינת עמוד ──────────────────────────────────
+    # ── Macro Event Banner ───────────────────────────────────────────────
+    macro = is_macro_event_soon(days=1)
+    if macro["is_soon"]:
+        st.warning(f"📅 **אירוע מקרו היום/מחר:** {macro['event_name']} — הסוכן **לא יקנה** היום")
+    else:
+        nxt = next_macro_event()
+        st.caption(f"📅 אירוע מקרו הבא: {nxt['event_name']} בעוד {nxt['days_away']} ימים")
+
+    # ── Auto Exit + Rebalance — רץ בכל טעינת עמוד ──────────────────────
     if portfolio:
         portfolio, cash, trades, auto_sold, auto_report = _run_auto_exit(
-            portfolio, cash, trades, val_tp, val_sl, "ערך"
+            portfolio, cash, trades, val_tp, val_sl, "ערך", max_hold_days=val_te
         )
         portfolio, cash, trades, rb_count, rb_report = _run_rebalance(
             portfolio, cash, trades, val_rb, "ערך"
@@ -383,6 +509,21 @@ def render_value_agent(df_all: pd.DataFrame):
                         skipped.append(f"{sym} ({sec_chk['reason']})")
                         continue
 
+                    # 📅 Macro Calendar — לא קונים ביום אירוע מקרו
+                    if is_macro_event_soon(days=1)["is_soon"]:
+                        st.warning("📅 אירוע מקרו היום — קנייה מושהית")
+                        break
+
+                    # 📊 Volume Confirmation
+                    if float(row.get("vol_ratio", 1.0)) < 0.5:
+                        skipped.append(f"{sym} (ווליום נמוך)")
+                        continue
+
+                    # 📈 Weekly Trend — MA50
+                    if not bool(row.get("ma50_trending", True)):
+                        skipped.append(f"{sym} (MA50 יורד)")
+                        continue
+
                     # 🧬 RL Check — מניעת קנייה חוזרת אחרי 2 SL ברצף
                     rl = should_buy(sym, min_trades=3, min_win_rate=35.0)
                     if not rl["allowed"]:
@@ -402,11 +543,12 @@ def render_value_agent(df_all: pd.DataFrame):
                     })
                     cash -= alloc
                     existing.add(sym)
+                    vol_r = float(row.get("vol_ratio", 1.0))
                     trades.insert(0, {
                         "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "📌": sym, "↔️": "קנייה",
                         "💰": f"{lp:.3f}",
-                        "📊": f"ציון {int(row.get('Score',0))}/6 | {regime['emoji']} | RL+{boost:+.0f}",
+                        "📊": f"ציון {int(row.get('Score',0))}/6 | {regime['emoji']} | Vol:{vol_r:.1f}x | RL+{boost:+.0f}",
                         "🏷️": _asset_label(sym),
                     })
                     bought += 1
@@ -415,7 +557,7 @@ def render_value_agent(df_all: pd.DataFrame):
                 save("val_trades_log", trades[:200])
                 msg = f"✅ נקנו {bought} נכסים! TP +{val_tp}% / SL -{val_sl}%"
                 if skipped:
-                    msg += f"\n⚠️ RL חסם: {', '.join(skipped[:3])}"
+                    msg += f"\n⚠️ חסום: {', '.join(skipped[:3])}"
                 st.success(msg)
                 st.rerun()
 
@@ -501,6 +643,8 @@ def render_value_agent(df_all: pd.DataFrame):
             })
         st.dataframe(pd.DataFrame(rows), hide_index=True)
 
+    render_analytics(trades, initial, "💎 ערך")
+
     if trades:
         st.markdown("#### 📋 יומן עסקאות")
         st.dataframe(pd.DataFrame(trades[:20]), hide_index=True)
@@ -534,22 +678,32 @@ def render_day_trade_agent(df_all: pd.DataFrame):
     initial   = float(load("day_initial", 100000.0))
 
     # ── הגדרות Stop-Loss / Take-Profit / Rebalance ──────────────────────
-    with st.expander("⚙️ הגדרות Stop-Loss / Take-Profit / Rebalance", expanded=False):
-        col_tp, col_sl, col_rb = st.columns(3)
-        day_tp = col_tp.slider("🎯 Take-Profit %",     1, 15, 4, 1, key="day_tp_pct",
+    with st.expander("⚙️ הגדרות Stop-Loss / Take-Profit / Rebalance / Time-Exit", expanded=False):
+        col_tp, col_sl = st.columns(2)
+        col_rb, col_te = st.columns(2)
+        day_tp = col_tp.slider("🎯 Take-Profit %",       1, 15, 4, 1, key="day_tp_pct",
                                help="מוכר כשהרווח מגיע לאחוז זה")
-        day_sl = col_sl.slider("🛑 Trailing Stop %",   1, 10, 2, 1, key="day_sl_pct",
+        day_sl = col_sl.slider("🛑 Trailing Stop %",     1, 10, 2, 1, key="day_sl_pct",
                                help="מוכר כשירידה מהשיא מגיעה לאחוז זה")
-        day_rb = col_rb.slider("🔁 Rebalance מקס %",  10, 50, 25, 5, key="day_rebalance_pct",
+        day_rb = col_rb.slider("🔁 Rebalance מקס %",    10, 50, 25, 5, key="day_rebalance_pct",
                                help="מוכר עודף כשפוזיציה חורגת ממשקל זה")
-        save("day_tp_pct", day_tp)
-        save("day_sl_pct", day_sl)
-        save("day_rebalance_pct", day_rb)
+        day_te = col_te.slider("⏳ Time-Exit (ימים)",    0, 30, 7, 1, key="day_time_exit",
+                               help="מוכר פוזיציה תקועה (רווח < 2%) אחרי N ימים. 0=כבוי")
+        save("day_tp_pct", day_tp); save("day_sl_pct", day_sl)
+        save("day_rebalance_pct", day_rb); save("day_time_exit", day_te)
+
+    # ── Macro Event Banner ───────────────────────────────────────────────
+    macro = is_macro_event_soon(days=1)
+    if macro["is_soon"]:
+        st.warning(f"📅 **אירוע מקרו היום/מחר:** {macro['event_name']} — הסוכן **לא יקנה** היום")
+    else:
+        nxt = next_macro_event()
+        st.caption(f"📅 אירוע מקרו הבא: {nxt['event_name']} בעוד {nxt['days_away']} ימים")
 
     # ── Auto Exit + Rebalance — רץ בכל טעינת עמוד ──────────────────────
     if portfolio:
         portfolio, cash, trades, auto_sold, auto_report = _run_auto_exit(
-            portfolio, cash, trades, day_tp, day_sl, "יומי"
+            portfolio, cash, trades, day_tp, day_sl, "יומי", max_hold_days=day_te
         )
         portfolio, cash, trades, rb_count, rb_report = _run_rebalance(
             portfolio, cash, trades, day_rb, "יומי"
@@ -636,6 +790,21 @@ def render_day_trade_agent(df_all: pd.DataFrame):
                         skipped.append(f"{sym} ({sec_chk['sector_he']})")
                         continue
 
+                    # 📅 Macro Calendar
+                    if is_macro_event_soon(days=1)["is_soon"]:
+                        st.warning("📅 אירוע מקרו היום — קנייה יומית מושהית")
+                        break
+
+                    # 📊 Volume Confirmation (יומי: סף נמוך יותר)
+                    if float(row.get("vol_ratio", 1.0)) < 0.4:
+                        skipped.append(f"{sym} (ווליום)")
+                        continue
+
+                    # 📈 MA50 Trend
+                    if not bool(row.get("ma50_trending", True)):
+                        skipped.append(f"{sym} (MA50↓)")
+                        continue
+
                     # 🧬 RL Check
                     rl = should_buy(sym, min_trades=3, min_win_rate=30.0)
                     if not rl["allowed"]:
@@ -653,11 +822,12 @@ def render_day_trade_agent(df_all: pd.DataFrame):
                     })
                     cash -= alloc
                     existing.add(sym)
+                    vol_r = float(row.get("vol_ratio", 1.0))
                     trades.insert(0, {
                         "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
                         "📌": sym, "↔️": "קנייה-יומי",
                         "💰": f"{lp:.3f}",
-                        "📊": f"RSI {row.get('RSI',0):.0f} | {regime['emoji']} | RL{boost:+.0f}",
+                        "📊": f"RSI {row.get('RSI',0):.0f} | {regime['emoji']} | Vol:{vol_r:.1f}x | RL{boost:+.0f}",
                         "🏷️": _asset_label(sym),
                     })
                     bought += 1
@@ -666,7 +836,7 @@ def render_day_trade_agent(df_all: pd.DataFrame):
                 save("day_trades_log", trades[:300])
                 msg = f"✅ נקנו {bought} פוזיציות! TP +{day_tp}% / SL -{day_sl}%"
                 if skipped:
-                    msg += f" | RL חסם: {', '.join(skipped)}"
+                    msg += f" | חסום: {', '.join(skipped)}"
                 st.success(msg)
                 st.rerun()
 
@@ -753,6 +923,8 @@ def render_day_trade_agent(df_all: pd.DataFrame):
                 "📦 כמות":  f"{p['Qty']:.4f}",
             })
         st.dataframe(pd.DataFrame(rows), hide_index=True)
+
+    render_analytics(trades, initial, "⚡ יומי")
 
     if trades:
         st.markdown("#### 📋 עסקאות")

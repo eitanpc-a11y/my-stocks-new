@@ -119,6 +119,15 @@ if not get_current_token():
     token = create_session(current_user)
     set_token_in_url(token)
 
+# ─── הפעלה אוטומטית של הסוכנים ברקע ──────────────────────────────────────────
+# get_scheduler() הוא singleton — יוצר thread אחד לכל תהליך, ולא כפול בריפרש
+try:
+    _sched = start_background_scheduler()
+    if not st.session_state.get("_scheduler_started"):
+        st.session_state["_scheduler_started"] = True
+except Exception as _e:
+    pass
+
 # ─── משיכת נתונים ודחיפה לסוכנים ──────────────────────────────────────────────
 ALL_TICKERS = list(set(MY_STOCKS_BASE + SCAN_LIST + TASE_SCAN))
 try:
@@ -435,18 +444,19 @@ with tabs[27]:
     </div>
     """, unsafe_allow_html=True)
     
-    scheduler = get_scheduler()
+    scheduler = get_scheduler()   # singleton — כבר הופעל אוטומטית בטעינה
     status = scheduler.get_status()
-    
+
     st.subheader("⚙️ סטטוס סוכנים")
-    
+    st.info("🤖 **הסוכנים רצים אוטומטית** — סוכן ערך כל 6 שעות | סוכן יומי כל 4 שעות | ML פעם ביום. אין צורך בהפעלה ידנית.")
+
     col_s1, col_s2, col_s3, col_s4 = st.columns(4)
     with col_s1:
         running = "✅ פעיל" if status["running"] else "❌ כבוי"
         st.metric("🔄 Scheduler", running)
     with col_s2:
         alive = "✅ רץ" if status["thread_alive"] else "⏸️ עצור"
-        st.metric("⚡ חוט", alive)
+        st.metric("⚡ Thread", alive)
     with col_s3:
         val_cash = load("val_cash_ils", 100000.0)
         st.metric("💎 סוכן ערך", f"₪{val_cash:,.0f}")

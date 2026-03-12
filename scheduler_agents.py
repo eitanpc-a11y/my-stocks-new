@@ -9,12 +9,16 @@ import logging
 from datetime import datetime
 from storage import load, save
 from api_cache import cached_api_call, throttle
+from macro_calendar import is_macro_event_soon
 
 logger = logging.getLogger(__name__)
 
 # ─── Standalone data fetcher (no st.cache_data, works in background thread) ──
 def _fetch_price_and_rsi(symbol: str) -> dict | None:
-    """Fetch price + basic technicals directly from yfinance — no Streamlit."""
+    """
+    Fetch price + technicals from yfinance — no Streamlit.
+    ✅ Zero extra API calls: vol_ratio + ma50_trending from existing hist.
+    """
     try:
         ticker = yf.Ticker(symbol)
         hist = ticker.history(period="6mo")
@@ -38,24 +42,44 @@ def _fetch_price_and_rsi(symbol: str) -> dict | None:
         ret_20d = float(((close.iloc[-1] / close.iloc[-20]) - 1) * 100) if len(close) >= 20 else 0
 
         # MA
-        ma50  = float(close.rolling(50).mean().iloc[-1])  if len(close) >= 50  else price
+        ma50_series = close.rolling(50).mean()
+        ma50  = float(ma50_series.iloc[-1])  if len(close) >= 50  else price
         ma200 = float(close.rolling(200).mean().iloc[-1]) if len(close) >= 200 else price
 
-        # Basic score (no fundamentals in background thread to keep it fast)
+        # ── Volume Ratio (ללא API נוסף — מ-hist קיים) ──────────────────
+        if "Volume" in hist.columns and len(hist) >= 20:
+            vol_avg = float(hist["Volume"].rolling(20).mean().iloc[-1])
+            vol_now = float(hist["Volume"].iloc[-1])
+            vol_ratio = round(vol_now / vol_avg, 2) if vol_avg > 0 else 1.0
+        else:
+            vol_ratio = 1.0
+
+        # ── MA50 Trending (מולטי-טיימפריים proxy ללא API) ───────────────
+        # MA50 עולה = מגמה שבועית חיובית
+        if len(close) >= 70:
+            ma50_20d_ago = float(ma50_series.iloc[-21]) if not np.isnan(ma50_series.iloc[-21]) else ma50
+            ma50_trending = ma50 > ma50_20d_ago
+        else:
+            ma50_trending = True   # ברירת מחדל: לא חוסמים
+
+        # Basic score
         score = 0
-        if price > ma50:   score += 1
-        if price > ma200:  score += 1
-        if rsi < 60:       score += 1
-        if ret_20d > 0:    score += 1
-        if ret_5d > -5:    score += 1
+        if price > ma50:      score += 1
+        if price > ma200:     score += 1
+        if rsi < 60:          score += 1
+        if ret_20d > 0:       score += 1
+        if ret_5d > -5:       score += 1
+        if vol_ratio >= 0.8:  score += 1   # בונוס ווליום תקין
 
         return {
-            "Symbol":  symbol,
-            "Price":   round(price, 4),
-            "RSI":     round(rsi, 1),
-            "Score":   score,
-            "ret_5d":  round(ret_5d, 2),
-            "ret_20d": round(ret_20d, 2),
+            "Symbol":       symbol,
+            "Price":        round(price, 4),
+            "RSI":          round(rsi, 1),
+            "Score":        score,
+            "ret_5d":       round(ret_5d, 2),
+            "ret_20d":      round(ret_20d, 2),
+            "vol_ratio":    vol_ratio,
+            "ma50_trending": bool(ma50_trending),
         }
     except Exception as e:
         logger.debug(f"_fetch_price_and_rsi error {symbol}: {e}")
@@ -232,6 +256,27 @@ def run_val_agent():
                     item = {**item, "TrailingHigh": round(trail_high, 4)}
                 trail_sl_price = trail_high * (1 - sl_pct / 100)
                 profit = ((lp / buy_price) - 1) * 100
+
+                # ⏳ Time-Based Exit — פוזיציה תקועה
+                te_days = int(load("val_time_exit", 21))
+                if te_days > 0 and item.get("BuyDate"):
+                    try:
+                        buy_dt = datetime.fromisoformat(str(item["BuyDate"])).date()
+                        hold_d = (datetime.now().date() - buy_dt).days
+                    except Exception:
+                        hold_d = 0
+                    if hold_d >= te_days and profit < 2.0:
+                        cash += lp * qty
+                        trades_log.insert(0, {
+                            "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "📌": sym, "↔️": "⏳ Time-Exit ערך",
+                            "💰": f"{lp:.3f}",
+                            "📊": f"{profit:.1f}% | {hold_d}d תקוע",
+                            "🏷️": _asset_type(sym),
+                        })
+                        logger.info(f"val_agent: time-exit {sym} {profit:.1f}% ({hold_d}d)")
+                        continue
+
                 if profit >= tp_pct:
                     cash += lp * qty
                     trades_log.insert(0, {
@@ -334,6 +379,24 @@ def run_val_agent():
                     logger.info(f"val_agent: skipping {sym} — earnings soon")
                     continue
 
+                # 📅 Macro Calendar — לא קונים ביום FOMC/CPI/NFP
+                macro = is_macro_event_soon(days=1)
+                if macro["is_soon"]:
+                    logger.info(f"val_agent: macro event {macro['event_name']} — skipping buys")
+                    break
+
+                # 📊 Volume Confirmation — ווליום לא אפסי
+                vol_ratio = float(row.get("vol_ratio", 1.0))
+                if vol_ratio < 0.5:
+                    logger.info(f"val_agent: skipping {sym} — low volume ({vol_ratio:.2f}x)")
+                    continue
+
+                # 📈 Weekly Trend (MA50 עולה = מגמה שבועית חיובית)
+                ma50_up = bool(row.get("ma50_trending", True))
+                if not ma50_up:
+                    logger.info(f"val_agent: skipping {sym} — MA50 downtrend")
+                    continue
+
                 # 🗳️ Consensus Voting — רק אם ≥2 מקורות מסכימים
                 consensus = check_consensus_buy(sym, min_sources=2, min_confidence=60)
                 if not consensus["approved"]:
@@ -433,6 +496,27 @@ def run_day_agent():
                     item = {**item, "TrailingHigh": round(trail_high, 4)}
                 trail_sl_price = trail_high * (1 - sl_pct / 100)
                 profit = ((lp / buy_price) - 1) * 100
+
+                # ⏳ Time-Based Exit — יומי: קצר יותר
+                te_days = int(load("day_time_exit", 7))
+                if te_days > 0 and item.get("BuyDate"):
+                    try:
+                        buy_dt = datetime.fromisoformat(str(item["BuyDate"])).date()
+                        hold_d = (datetime.now().date() - buy_dt).days
+                    except Exception:
+                        hold_d = 0
+                    if hold_d >= te_days and profit < 2.0:
+                        cash += lp * qty
+                        trades_log.insert(0, {
+                            "⏰": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "📌": sym, "↔️": "⏳ Time-Exit יומי",
+                            "💰": f"{lp:.3f}",
+                            "📊": f"{profit:.1f}% | {hold_d}d תקוע",
+                            "🏷️": _asset_type(sym),
+                        })
+                        logger.info(f"day_agent: time-exit {sym} {profit:.1f}% ({hold_d}d)")
+                        continue
+
                 if profit >= tp_pct:
                     cash += lp * qty
                     trades_log.insert(0, {
@@ -532,6 +616,24 @@ def run_day_agent():
                 # 🗓️ הימנע מרבעוניים
                 if _has_earnings_soon(sym, days=5):
                     logger.info(f"day_agent: skipping {sym} — earnings soon")
+                    continue
+
+                # 📅 Macro Calendar — יומי רגיש יותר לאירועים
+                macro = is_macro_event_soon(days=1)
+                if macro["is_soon"]:
+                    logger.info(f"day_agent: macro {macro['event_name']} — skipping buys")
+                    break
+
+                # 📊 Volume Confirmation — ווליום לא אפסי (יומי: סף נמוך יותר)
+                vol_ratio = float(row.get("vol_ratio", 1.0))
+                if vol_ratio < 0.4:
+                    logger.info(f"day_agent: skipping {sym} — low volume ({vol_ratio:.2f}x)")
+                    continue
+
+                # 📈 Weekly Trend — MA50 trending up
+                ma50_up = bool(row.get("ma50_trending", True))
+                if not ma50_up:
+                    logger.info(f"day_agent: skipping {sym} — MA50 downtrend")
                     continue
 
                 # 🗳️ Consensus Voting (גמיש יותר ביומי — מינימום 1 מקור ML)
@@ -639,19 +741,37 @@ class UltraAdvancedScheduler:
         """Alias used by some UI components."""
         self.run_ml_agent()
 
+    def _run_in_thread(self, fn, name: str):
+        """מריץ פונקציה ב-thread נפרד כדי לא לחסום את loop הראשי."""
+        t = threading.Thread(target=fn, daemon=True, name=name)
+        t.start()
+
     def _loop(self):
-        last_val = 0
-        last_day = 0
-        last_ml  = 0
+        # ── דחיית הריצה הראשונה — מניעת עומס על yfinance עם טעינת האפליקציה ──
+        # val_agent  : ריצה ראשונה אחרי 5 דקות   → אחר כך כל 6 שעות
+        # day_agent  : ריצה ראשונה אחרי 10 דקות  → אחר כך כל 4 שעות
+        # ml_agent   : ריצה ראשונה אחרי 20 דקות  → אחר כך כל 24 שעות
+        now0 = time.time()
+        last_val = now0 - (6 * 3600 - 5  * 60)   # עוד 5 דקות לריצה ראשונה
+        last_day = now0 - (4 * 3600 - 10 * 60)   # עוד 10 דקות
+        last_ml  = now0 - (24 * 3600 - 20 * 60)  # עוד 20 דקות
+        logger.info("Scheduler loop: first val in 5m, day in 10m, ml in 20m")
+
         while self.running:
             try:
                 now = time.time()
-                if now - last_val > 6 * 3600:     # ערך: כל 6 שעות
-                    self.run_val_agent(); last_val = now
-                if now - last_day > 4 * 3600:     # יומי: כל 4 שעות (במקום שעה)
-                    self.run_day_agent(); last_day = now
-                if now - last_ml > 24 * 3600:     # ML: פעם ביום
-                    self.run_ml_agent(); last_ml = now
+                # ── סוכן ערך: כל 6 שעות ──────────────────────────────
+                if now - last_val > 6 * 3600:
+                    self._run_in_thread(self.run_val_agent, "val_agent")
+                    last_val = now
+                # ── סוכן יומי: כל 4 שעות ────────────────────────────
+                if now - last_day > 4 * 3600:
+                    self._run_in_thread(self.run_day_agent, "day_agent")
+                    last_day = now
+                # ── ML: פעם ביום ─────────────────────────────────────
+                if now - last_ml > 24 * 3600:
+                    self._run_in_thread(self.run_ml_agent, "ml_agent")
+                    last_ml = now
                 time.sleep(60)
             except Exception as e:
                 logger.error(f"scheduler loop error: {e}")
@@ -661,9 +781,9 @@ class UltraAdvancedScheduler:
         if self.running:
             return
         self.running = True
-        self.thread  = threading.Thread(target=self._loop, daemon=True, name="scheduler")
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
         self.thread.start()
-        logger.info("Scheduler started")
+        logger.info("Scheduler started — val:6h / day:4h / ml:24h")
 
     def get_status(self):
         return {

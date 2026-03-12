@@ -9,6 +9,10 @@ import yfinance as yf
 import time
 import logging
 from datetime import datetime, timedelta
+try:
+    from api_cache import throttle as _throttle
+except Exception:
+    def _throttle(service, gap=0.4): time.sleep(gap)
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +31,9 @@ except Exception:
 # ═══════════════════════════════════════════════════════════
 @st.cache_data(ttl=86400)
 def _fetch_fundamentals(ticker: str) -> dict:
-    """Returns raw fundamental dict from yfinance .info  (cached 24 h)."""
+    """Returns raw fundamental dict from yfinance .info  (cached 24 h).
+    throttle משותף עם api_cache — מונע 429 כשhit קאש פג לכל 50+ סימבולים."""
+    _throttle("yfinance", 0.35)
     try:
         info = yf.Ticker(ticker).info or {}
         return {
@@ -59,9 +65,10 @@ def _fetch_fundamentals(ticker: str) -> dict:
 # ═══════════════════════════════════════════════════════════
 @st.cache_data(ttl=600)
 def _fetch_technical(ticker: str) -> dict | None:
-    """Returns price + all technical indicators  (cached 10 min)."""
+    """Returns price + all technical indicators (cached 10 min).
+    throttle משותף — גם טעינת האפליקציה וגם הסוכן האוטומטי חולקים את אותו מגבלת קצב."""
     try:
-        time.sleep(0.05)
+        _throttle("yfinance", 0.35)
 
         # Live price
         if HAS_REALTIME:
