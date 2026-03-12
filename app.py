@@ -10,7 +10,6 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
-from streamlit_cookies_manager import EncryptedCookieManager
 
 # ייבוא הגדרות ולוגיקה
 from config import (HELP, MY_STOCKS_BASE, SCAN_LIST,
@@ -19,6 +18,8 @@ from logic   import fetch_master_data
 from storage import load_all_to_session, save, load
 from tooltips_he import inject_tooltip_css, tooltip, render_glossary
 from scheduler_agents import start_background_scheduler, get_scheduler
+from session_manager import try_auto_login, create_session, delete_session, \
+                            set_token_in_url, clear_token_from_url, get_current_token
 
 # ייבוא כל מודולי ה-AI
 import realtime_data, market_ai, bull_bear, simulator
@@ -29,13 +30,8 @@ import execution_ai, failsafes_ai, ml_learning_ai
 import social_sentiment_ai, tax_fees_ai, market_scanner
 import ai_portfolio, commodities_tab, pattern_ai, portfolio_optimizer
 
-# ניהול משתמשים (נשאר חיצוני כדי לשמור על סדר בלוגין)
+# ניהול משתמשים
 from user_manager import init_user_session, render_login_page, save_user_data
-
-# ─── ניהול Cookies לענן (Render) ──────────────────────────────────────────────
-cookies = EncryptedCookieManager(password="HubElite_Secure_Cloud_Key_2026_Long_String", prefix="render_hub/")
-if not cookies.ready():
-    st.stop()
 
 # ─── הגדרות דף ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -99,24 +95,29 @@ try:
 except Exception:
     pass
 
-# ─── לוגיקת התחברות חכמה עם Cookies ──────────────────────────────────────────
+# ─── לוגיקת התחברות חכמה עם Session Token ב-URL ──────────────────────────────
 init_user_session()
 
-saved_user = cookies.get("active_user")
-if saved_user and not st.session_state.get("current_user"):
-    st.session_state["current_user"] = saved_user
-    db = load("app_users_db", {})
-    if saved_user in db:
-        st.session_state["portfolio_buy_prices"] = db[saved_user].get("portfolio_buy_prices", {})
-        st.session_state["portfolio_quantities"] = db[saved_user].get("portfolio_quantities", {})
+# ── שלב 1: נסה שחזור אוטומטי מהטוקן שב-URL (?t=...) ────────────────────────
+if not st.session_state.get("current_user"):
+    auto_user = try_auto_login()
+    if auto_user:
+        db = load("app_users_db", {})
+        if auto_user in db:
+            st.session_state["current_user"] = auto_user
+            st.session_state["portfolio_buy_prices"] = db[auto_user].get("portfolio_buy_prices", {})
+            st.session_state["portfolio_quantities"] = db[auto_user].get("portfolio_quantities", {})
 
+# ── שלב 2: אם עוד לא מחובר — הצג דף כניסה ───────────────────────────────────
 if not st.session_state.get("current_user"):
     render_login_page()
-    if st.session_state.get("current_user"):
-        cookies["active_user"] = st.session_state["current_user"]
-        cookies.save()
-        st.rerun()
     st.stop()
+
+# ── שלב 3: מחובר — צור טוקן חדש אם אין (כניסה ראשונה) ─────────────────────
+current_user = st.session_state["current_user"]
+if not get_current_token():
+    token = create_session(current_user)
+    set_token_in_url(token)
 
 # ─── משיכת נתונים ודחיפה לסוכנים ──────────────────────────────────────────────
 ALL_TICKERS = list(set(MY_STOCKS_BASE + SCAN_LIST + TASE_SCAN))
@@ -158,8 +159,10 @@ with col_head1:
 with col_head2:
     st.markdown(f'<div class="user-info-box">👤 {st.session_state["current_user"]}</div>', unsafe_allow_html=True)
     if st.button("🚪 התנתק"):
-        cookies.pop("active_user")
-        cookies.save()
+        token = get_current_token()
+        if token:
+            delete_session(token)
+        clear_token_from_url()
         st.session_state["current_user"] = None
         if "portfolio" in st.session_state:
             del st.session_state["portfolio"]
