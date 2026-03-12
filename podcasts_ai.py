@@ -1,0 +1,58 @@
+# podcasts_ai.py — פודקאסטים פיננסיים
+import streamlit as st
+
+
+def render_podcasts_analysis():
+    st.markdown(
+        '<div class="ai-card" style="border-right-color: #673ab7;">'
+        '<b>🎧 סוכן פודקאסטים:</b> סיכומי AI מהפודקאסטים הפיננסיים המובילים.</div>',
+        unsafe_allow_html=True,
+    )
+
+    podcasts = [
+        {
+            "name": "The All-In Podcast (פרק 164)",
+            "hosts": "Chamath, Calacanis, Sacks, Friedberg",
+            "rating": "⭐⭐⭐⭐⭐",
+            "focus": "בינה מלאכותית, הון סיכון, גיאופוליטיקה.",
+            "summary": (
+                "המנחים ניתחו את 'בועת ה-AI'. צ'מאט טען שחברות SaaS קלאסיות בסכנה — "
+                "מודלים Open Source מאפשרים לשכפל אותן בעלות אפסית. "
+                "סאקס ופרידברג: הכסף האמיתי נמצא בתשתיות — שרתים, שבבים, וחשמל."
+            ),
+            "action": "💡 הסט מ-SaaS קטנה → תשתיות AI: NVDA, AMD, אנרגיה.",
+            "tickers": ["NVDA", "AMD", "MSFT", "PLTR"],
+        },
+        {
+            "name": "WSJ — What's News",
+            "hosts": "צוות WSJ",
+            "rating": "⭐⭐⭐⭐",
+            "focus": "הפד, אינפלציה, ריביות.",
+            "summary": (
+                "האינפלציה מסרבת לרדת ל-2%. ריבית גבוהה עד סוף 2025. "
+                "חברות ממומנות בחובות ייפגעו. 'חברות מבצר' עם מזומנים — ירוויחו."
+            ),
+            "action": "🛡️ הצדקה לקריטריונים 5-6 ב-PDF: מזומן > חוב.",
+            "tickers": ["AAPL", "COST", "JPM"],
+        },
+        {
+            "name": "Invest Like the Best",
+            "hosts": "Patrick O'Shaughnessy",
+            "rating": "⭐⭐⭐⭐⭐",
+            "focus": "קרנות גידור, הון פרטי.",
+            "summary": (
+                "ראיון עם מומחה סייבר: תקציבי אבטחה הפכו 'קשיחים'. "
+                "אזהרה: מכפילי ×20-30 מסוכנים — חפש חברות סייבר עם רווחיות נקייה."
+            ),
+            "action": "🔒 חשיפה לסייבר רק בחברות רווחיות (קריטריון 3 ב-PDF).",
+            "tickers": ["CRWD", "PANW", "FTNT"],
+        },
+    ]
+
+    for p in podcasts:
+        with st.expander(f"🎙️ {p['name']} | {p['rating']}"):
+            st.markdown(f"**מנחים:** {p['hosts']} | **מיקוד:** {p['focus']}")
+            st.markdown("---")
+            st.markdown(f"**🧠 סיכום AI:** {p['summary']}")
+            st.markdown(f"**{p['action']}**")
+            st.markdown(f"**📈 מניות:** {', '.join(p['tickers'])}")
